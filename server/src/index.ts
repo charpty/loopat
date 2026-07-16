@@ -63,7 +63,7 @@ import { queryUserTokenUsage, queryWorkspaceTokenUsage, queryDailyTokenUsage, qu
 import { createApiToken, listApiTokens, revokeApiToken } from "./api-tokens"
 import { listBoards, createBoard, renameBoard, listKanbanColumns, addCard, toggleCard, deleteCard, moveCard, updateCardMeta, updateCardBlock, reorderCards, createColumn, deleteColumn, readKanbanConfig, saveColumnOrder, setColumnColor, renameColumn, assignDriverForCard, createLoopFromCard, linkLoopToCard, kanbanUserCtx } from "./kanban"
 import { printBootstrapBanner, printReadyLine } from "./bootstrap"
-import { resolveProvider } from "./providers"
+import { resolveGitHostSettings } from "./providers"
 import { ensureSandboxClaudeBinary } from "./claude-binary"
 import {
   buildCodexEnv,
@@ -1156,9 +1156,11 @@ app.get("/api/personal/status", requireAuth, async (c) => {
   // Per-vault SSH public keys — what the user registers on the TEAM git host
   // for knowledge/notes/repos. Distinct from the deploy key (publicKey above).
   const vaultKeys = await listVaultPublicKeys(userId)
-  // The active provider comes from the extensions dir (no config.json needed),
-  // and supplies its own baseUrl / defaultRepo / tokenHelp defaults.
-  const provider = await resolveProvider()
+  const gitHost = await resolveGitHostSettings()
+  const directRepo = gitHost.provider?.directRepo?.({
+    baseUrl: gitHost.baseUrl,
+    repoName: gitHost.defaultRepo,
+  }) ?? null
   return c.json({
     userId,
     personalRepo: user.personalRepo ?? null,
@@ -1166,10 +1168,11 @@ app.get("/api/personal/status", requireAuth, async (c) => {
     vaultKeys,
     imported,
     gitHost: {
-      provider: provider?.id ?? "github",
-      baseUrl: provider?.baseUrl ?? null,
-      defaultRepo: provider?.defaultRepo ?? "loopat-personal",
-      tokenHelp: provider?.tokenHelp ?? null,
+      provider: gitHost.providerId,
+      baseUrl: gitHost.baseUrl ?? null,
+      defaultRepo: gitHost.defaultRepo,
+      tokenHelp: gitHost.provider?.tokenHelp ?? null,
+      directRepo,
     },
   })
 })
@@ -1278,25 +1281,37 @@ app.post("/api/personal/import", requireAuth, async (c) => {
   return c.json({ ok: true, autoInitialized: !!r.autoInitialized, cryptKey: r.cryptKey ?? null })
 })
 
-// POST /api/personal/github — onboard personal via a GitHub PAT (host-side
-// only): create the repo, register the deploy key, clone + git-crypt. The PAT
-// never enters a sandbox; runtime git uses the deploy key / vault. See
-// docs/identity.md (integration contract).
+// POST /api/personal/github — backward-compatible provider onboarding route.
+// Token-based providers create/locate the repo through their API. An
+// administrator-pinned direct repo instead uses the loopat host's SSH identity
+// and never accepts its target repository from the client.
 app.post("/api/personal/github", requireAuth, async (c) => {
   const userId = c.get("userId") as string
   const user = await findUser(userId)
   if (!user) return c.json({ error: "user missing" }, 500)
   const body = await c.req.json().catch(() => ({}))
   const token = typeof body.token === "string" ? body.token.trim() : ""
-  if (!token) return c.json({ error: "github token required" }, 400)
-  // Provider + its baseUrl/defaultRepo come from the extensions dir, not
-  // config.json. A request body may still override any of them.
-  const p = await resolveProvider(typeof body.provider === "string" && body.provider.trim() ? body.provider.trim() : undefined)
-  const repoName = (typeof body.repoName === "string" && body.repoName.trim()) || p?.defaultRepo || "loopat-personal"
-  const baseUrl = (typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl.trim() : undefined) ?? p?.baseUrl
+  // Direct repositories are resolved only from administrator-owned settings.
+  // Client overrides must never select a repository reached with the host's
+  // SSH identity.
+  const configuredGitHost = await resolveGitHostSettings()
+  const directRepo = configuredGitHost.provider?.directRepo?.({
+    baseUrl: configuredGitHost.baseUrl,
+    repoName: configuredGitHost.defaultRepo,
+  }) ?? null
+  const gitHost = directRepo
+    ? configuredGitHost
+    : await resolveGitHostSettings({
+        provider: typeof body.provider === "string" && body.provider.trim() ? body.provider.trim() : undefined,
+        baseUrl: typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl.trim() : undefined,
+        defaultRepo: typeof body.repoName === "string" && body.repoName.trim() ? body.repoName.trim() : undefined,
+      })
+  if (!token && !directRepo) return c.json({ error: "git host token required" }, 400)
+  const repoName = gitHost.defaultRepo
+  const baseUrl = gitHost.baseUrl
   const cryptKey = typeof body.cryptKey === "string" && body.cryptKey.trim() ? body.cryptKey.trim() : undefined
-  const provider = p?.id ?? "github"
-  const r = await setupPersonalViaProvider({ userId, provider, token, baseUrl, repoName, cryptKey })
+  const provider = gitHost.providerId
+  const r = await setupPersonalViaProvider({ userId, provider, token, baseUrl, repoName, cryptKey, directRepo: directRepo ?? undefined })
   if (!r.ok) {
     if (r.needsCryptKey) return c.json({ error: r.error, needsCryptKey: true }, 409)
     return c.json({ error: r.error }, 400)
@@ -1311,10 +1326,12 @@ app.post("/api/personal/repos", requireAuth, async (c) => {
   const body = await c.req.json().catch(() => ({}))
   const token = typeof body.token === "string" ? body.token.trim() : ""
   if (!token) return c.json({ ok: false, repos: [], error: "token required" })
-  // Provider + baseUrl from the extensions dir (no config.json), request may override.
-  const p = await resolveProvider(typeof body.provider === "string" && body.provider.trim() ? body.provider.trim() : undefined)
-  const provider = p?.id ?? "github"
-  const baseUrl = (typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl.trim() : undefined) ?? p?.baseUrl
+  const gitHost = await resolveGitHostSettings({
+    provider: typeof body.provider === "string" && body.provider.trim() ? body.provider.trim() : undefined,
+    baseUrl: typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl.trim() : undefined,
+  })
+  const provider = gitHost.providerId
+  const baseUrl = gitHost.baseUrl
   try {
     // Validate the token first so a bad token surfaces as an error in the token
     // step, instead of an empty (misleading "no repos") picker.

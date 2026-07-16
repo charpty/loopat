@@ -143,7 +143,13 @@ export type PersonalStatus = {
    *  the team git host. */
   vaultKeys?: { vault: string; publicKey: string }[]
   imported: boolean
-  gitHost?: { provider: string; baseUrl: string | null; defaultRepo?: string; tokenHelp?: string | null }
+  gitHost?: {
+    provider: string
+    baseUrl: string | null
+    defaultRepo?: string
+    tokenHelp?: string | null
+    directRepo?: { url: string; path: string; owner: string } | null
+  }
 }
 
 // List the user's repos for the onboarding picker ("personal"-named first).
@@ -151,11 +157,15 @@ export type PersonalStatus = {
 // `error` instead of treating it as an empty list.
 export async function listPersonalRepos(
   token: string,
+  opts: { provider?: string; baseUrl?: string | null } = {},
 ): Promise<{ ok: boolean; repos: { name: string; path: string }[]; login?: string; error?: string }> {
+  const payload: Record<string, string> = { token }
+  if (opts.provider) payload.provider = opts.provider
+  if (opts.baseUrl) payload.baseUrl = opts.baseUrl
   const r = await apiFetch("/api/personal/repos", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ token }),
+    body: JSON.stringify(payload),
   })
   const j = await r.json().catch(() => ({}) as any)
   if (!r.ok) return { ok: false, repos: [], error: j?.error ?? "request failed" }
@@ -394,7 +404,7 @@ export async function setupPersonalGithub(
   token: string,
   repoName?: string,
   cryptKey?: string,
-  baseUrl?: string,
+  opts: { provider?: string; baseUrl?: string | null } = {},
 ): Promise<{
   ok: boolean
   error?: string
@@ -407,7 +417,8 @@ export async function setupPersonalGithub(
   const payload: Record<string, string> = { token }
   if (repoName) payload.repoName = repoName
   if (cryptKey) payload.cryptKey = cryptKey
-  if (baseUrl) payload.baseUrl = baseUrl
+  if (opts.provider) payload.provider = opts.provider
+  if (opts.baseUrl) payload.baseUrl = opts.baseUrl
   const r = await apiFetch("/api/personal/github", {
     method: "POST",
     headers: { "content-type": "application/json" },

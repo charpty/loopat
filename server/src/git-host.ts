@@ -10,6 +10,11 @@
 
 export type HostCred = { token: string; baseUrl?: string }
 export type RepoRef = { owner: string; name: string }
+export type DirectRepo = {
+  url: string
+  path: string
+  owner: string
+}
 
 /**
  * Onboarding is fully implemented by the provider (see GitHostProvider.onboarding).
@@ -96,6 +101,13 @@ export interface GitHostProvider {
   readonly defaultRepo?: string
 
   /**
+   * Optional pre-configured repository that can be reached without the host
+   * API. This is intended for self-hosted installations where the loopat host
+   * already has an SSH identity and an administrator pins one repository.
+   */
+  directRepo?(opts: { baseUrl?: string; repoName: string }): DirectRepo | null
+
+  /**
    * Optional onboarding, FULLY implemented by the provider. When present, loopat
    * treats onboarding as MANDATORY: until it reports `done`, loop creation is
    * blocked and the UI shows the provider's current form.
@@ -142,7 +154,7 @@ export interface GitHostProvider {
     cred: HostCred,
     name: string,
     opts?: { private?: boolean },
-  ): Promise<{ url: string; created: boolean }>
+  ): Promise<{ url: string; created: boolean; path?: string }>
 
   /** ③ register a deploy key on a repo (only for "ssh-deploy-key" mode). */
   registerDeployKey?(

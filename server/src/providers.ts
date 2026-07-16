@@ -16,6 +16,7 @@ import { registerProvider, getProvider, type GitHostProvider } from "./git-host"
 import { extensionsProvidersDir } from "./paths"
 
 import "./github" // built-in, open-source
+import "./gitlab" // built-in GitLab-compatible host
 
 let extLoaded = false
 // Ids of providers loaded from extension files (NOT the built-in github). A
@@ -60,11 +61,53 @@ export async function loadExtensionProviders(): Promise<void> {
 export async function resolveProviderId(requested?: string): Promise<string> {
   await loadExtensionProviders()
   if (extensionProviderIds.length > 0) return extensionProviderIds[0]
-  return requested || "github"
+  if (requested) return requested
+  const envProvider = process.env.LOOPAT_GIT_HOST_PROVIDER || process.env.LOOPAT_GIT_PROVIDER
+  if (envProvider) return envProvider
+  try {
+    const { loadConfig } = await import("./config")
+    const cfg = await loadConfig()
+    if (cfg.gitHost?.provider) return cfg.gitHost.provider
+  } catch {
+    // Fall back to GitHub below when config is unavailable or malformed.
+  }
+  return "github"
 }
 
 /** Resolve and return the active provider object (see resolveProviderId). Its
  *  baseUrl / defaultRepo / tokenHelp let loopat run with no config.json. */
 export async function resolveProvider(requested?: string): Promise<GitHostProvider | undefined> {
   return getProvider(await resolveProviderId(requested))
+}
+
+export type GitHostSettingsRequest = {
+  provider?: string
+  baseUrl?: string
+  defaultRepo?: string
+}
+
+export type GitHostSettings = {
+  provider: GitHostProvider | undefined
+  providerId: string
+  baseUrl?: string
+  defaultRepo: string
+}
+
+export async function resolveGitHostSettings(requested: GitHostSettingsRequest = {}): Promise<GitHostSettings> {
+  const envBaseUrl = process.env.LOOPAT_GIT_HOST_BASE_URL || process.env.LOOPAT_GITLAB_BASE_URL
+  const envDefaultRepo = process.env.LOOPAT_GIT_HOST_DEFAULT_REPO || process.env.LOOPAT_PERSONAL_REPO_NAME
+  let cfg: { gitHost?: GitHostSettingsRequest } = {}
+  try {
+    const { loadConfig } = await import("./config")
+    cfg = await loadConfig()
+  } catch {
+    cfg = {}
+  }
+
+  const providerId = requested.provider || process.env.LOOPAT_GIT_HOST_PROVIDER || process.env.LOOPAT_GIT_PROVIDER || cfg.gitHost?.provider || "github"
+  const provider = await resolveProvider(providerId)
+  const resolvedProviderId = provider?.id ?? providerId
+  const baseUrl = requested.baseUrl || envBaseUrl || cfg.gitHost?.baseUrl || provider?.baseUrl
+  const defaultRepo = requested.defaultRepo || envDefaultRepo || cfg.gitHost?.defaultRepo || provider?.defaultRepo || "loopat-personal"
+  return { provider, providerId: resolvedProviderId, baseUrl, defaultRepo }
 }

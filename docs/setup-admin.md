@@ -56,6 +56,34 @@ empty fields after first run. Fill it in:
 | `repos[]`       | each entry → cloned to `context/repos/<name>/`. Loops spawn against these. |
 | `mounts[]`      | **operator-level** mounts; `src` is any host path. Shared by every loop on this workspace. See §6. |
 
+Personal storage git host can also be selected here:
+
+```jsonc
+{
+  "gitHost": {
+    "provider": "gitlab",
+    "baseUrl": "https://gitlab.example.com",
+    "defaultRepo": "team/loopat-personal"
+  }
+}
+```
+
+`provider` defaults to `github`; standard GitLab hosts use the GitLab-compatible
+`/api/v4` API and HTTPS token git auth. A full, administrator-configured
+`namespace/repo` value enables direct SSH onboarding instead. This supports
+self-hosted installations whose API is protected by SSO: Loopat skips the API
+and uses the operating-system account's existing SSH identity for clone, pull,
+and push. Verify that account has write access before exposing the setup UI. The
+same values can be supplied with
+`LOOPAT_GIT_HOST_PROVIDER`, `LOOPAT_GIT_HOST_BASE_URL`, and
+`LOOPAT_GIT_HOST_DEFAULT_REPO`.
+
+Personal-repo commits use the provider identity when available, then
+`LOOPAT_GIT_AUTHOR_NAME` / `LOOPAT_GIT_AUTHOR_EMAIL`, then the operating-system
+account's Git configuration. Hosts with commit-email push rules should set a
+valid email globally (`git config --global user.email ...`) or
+through `LOOPAT_GIT_AUTHOR_EMAIL`.
+
 Provider config (`apiKey`, `model`, `baseUrl`) is **not** here — that
 lives per-user under `personal/<user>/.loopat/config.json`. Admins
 don't pre-fill API keys for the team.

@@ -46,10 +46,11 @@ import { existsSync as existsSyncBase } from "node:fs"
 import { loadConfig, loadPersonalConfig, loadKnowledgeConfig, writeVaultEnv } from "./config"
 import { ensurePersonalKeypair } from "./personal-keys"
 import { composeLoopClaudeConfig, writeLoopSettings } from "./compose"
-import { getProvider, type OnboardingView } from "./git-host"
+import { getProvider, type DirectRepo, type OnboardingView } from "./git-host"
 import { loadExtensionProviders, resolveProviderId, resolveProvider } from "./providers" // also registers built-in providers
 import { loadVaultEnvs } from "./vaults"
 import { withSpan } from "./tracer"
+import { selectGitAuthor, type GitAuthor } from "./git-author"
 
 const execFileP = promisify(execFile)
 
@@ -613,6 +614,8 @@ export async function setupPersonalViaProvider(opts: {
   baseUrl?: string
   repoName: string
   cryptKey?: string
+  /** Server-resolved admin configuration; never accept this from a client. */
+  directRepo?: DirectRepo
 }): Promise<
   | { ok: true; repo: string; repoUrl: string; created: boolean; autoInitialized?: boolean; cryptKey?: string }
   | { ok: false; error: string; needsCryptKey?: boolean }
@@ -624,24 +627,32 @@ export async function setupPersonalViaProvider(opts: {
 
   let login: string
   let email: string | undefined
-  try {
-    const auth = await provider.authenticate(cred)
-    login = auth.login
-    email = auth.email
-  } catch (e: any) {
-    return { ok: false, error: `${provider.id} auth failed: ${e?.message ?? e}` }
-  }
+  let repo: { url: string; created: boolean; path?: string }
+  if (opts.directRepo) {
+    login = opts.directRepo.owner
+    repo = { url: opts.directRepo.url, created: false, path: opts.directRepo.path }
+  } else {
+    try {
+      const auth = await provider.authenticate(cred)
+      login = auth.login
+      email = auth.email
+    } catch (e: any) {
+      return { ok: false, error: `${provider.id} auth failed: ${e?.message ?? e}` }
+    }
 
-  let repo: { url: string; created: boolean }
-  try {
-    repo = await provider.ensureRepo(cred, opts.repoName, { private: true })
-  } catch (e: any) {
-    return { ok: false, error: `ensure repo failed: ${e?.message ?? e}` }
+    try {
+      repo = await provider.ensureRepo(cred, opts.repoName, { private: true })
+    } catch (e: any) {
+      return { ok: false, error: `ensure repo failed: ${e?.message ?? e}` }
+    }
   }
 
   // Set up git auth per the provider's mode.
   let cloneUrl = repo.url
-  if (provider.gitAuthMode === "ssh-deploy-key") {
+  if (opts.directRepo) {
+    // The configured repository uses the loopat process account's SSH agent or
+    // default keys. No API call or generated deploy key is involved.
+  } else if (provider.gitAuthMode === "ssh-deploy-key") {
     // GitHub-style: register a loopat-generated deploy key; git clones via ssh.
     const { publicKey } = await ensurePersonalKeypair(opts.userId)
     if (publicKey && provider.registerDeployKey) {
@@ -652,7 +663,7 @@ export async function setupPersonalViaProvider(opts: {
       }
     }
   } else {
-    // https-token git: https://<login>:<token>@host/path — GitLab/Code use the
+    // https-token git: https://<login>:<token>@host/path — GitLab uses the
     // username + private_token as basic auth (GitHub PAT works the same way).
     // Normalize http→https. (MVP: the token lands in the worktree's .git/config —
     // fine for a private, user-owned personal repo; a credential-helper pass can
@@ -676,11 +687,18 @@ export async function setupPersonalViaProvider(opts: {
           login,
         })
     : undefined
-  const imp = await importPersonalFromRepo(opts.userId, cloneUrl, opts.cryptKey, { name: login, email }, seed)
+  const imp = await importPersonalFromRepo(
+    opts.userId,
+    cloneUrl,
+    opts.cryptKey,
+    { name: login, email },
+    seed,
+    opts.directRepo ? { sshAuthMode: "host" } : undefined,
+  )
   if (!imp.ok) return { ok: false, error: imp.error, needsCryptKey: imp.needsCryptKey }
   return {
     ok: true,
-    repo: `${login}/${opts.repoName}`,
+    repo: repo.path ?? `${login}/${opts.repoName}`,
     repoUrl: repo.url,
     created: repo.created,
     autoInitialized: imp.autoInitialized,
@@ -920,6 +938,7 @@ export async function importPersonalFromRepo(
   cryptKey?: string,
   author?: { name?: string; email?: string },
   seed?: (repoDir: string) => Promise<void>,
+  options?: { sshAuthMode?: "managed-key" | "host" },
 ): Promise<
   | { ok: true; autoInitialized?: boolean; cryptKey?: string }
   | {
@@ -939,22 +958,29 @@ export async function importPersonalFromRepo(
     return { ok: false, error: "personal/ is not empty — refusing to overwrite" }
   }
 
-  // https-token urls carry their own auth (https://user:token@…) and need no
-  // ssh deploy key; ssh urls require the loopat-managed deploy key.
+  // https-token URLs carry their own auth. SSH normally uses loopat's managed
+  // deploy key; an administrator-pinned direct repository can explicitly use
+  // the loopat process account's host SSH identity instead.
   const isHttps = /^https?:\/\//.test(repoUrl)
+  const sshAuthMode = options?.sshAuthMode ?? "managed-key"
   const priv = hostDeployKeyPath(userId)
-  if (!isHttps && !existsSyncBase(priv)) {
+  if (!isHttps && sshAuthMode === "managed-key" && !existsSyncBase(priv)) {
     return { ok: false, error: "deploy keypair missing — re-register" }
   }
 
-  // Clone into a tmp dir. ssh uses the deploy key (StrictHostKeyChecking=
-  // accept-new, no pre-populated known_hosts on first run); https auths via url.
+  // Clone into a tmp dir. SSH uses the selected managed/host identity and
+  // HTTPS authenticates via the URL.
   const tmp = await mkdtemp(join(tmpdir(), `loopat-import-${userId}-`))
-  // Bootstrap: first clone of the personal repo uses the host deploy-key (no
-  // vault key exists yet). Every later op uses the user's vault key.
-  const cloneEnv = isHttps ? { ...process.env } : { ...process.env, GIT_SSH_COMMAND: personalSshCommand(userId) }
+  // Persist the SSH choice in local git config after cloning. Later personal
+  // fetch/pull/push operations read it from there, so auth stays consistent.
+  const cloneEnv = isHttps
+    ? { ...process.env }
+    : { ...process.env, GIT_SSH_COMMAND: await personalSshCommand(userId, sshAuthMode) }
   try {
     await execFileP("git", ["clone", "--", repoUrl, tmp], { env: cloneEnv })
+    if (!isHttps) {
+      await execFileP("git", ["-C", tmp, "config", "loopat.personalSshAuth", sshAuthMode])
+    }
   } catch (e: any) {
     await rm(tmp, { recursive: true, force: true }).catch(() => {})
     const msg = (e?.stderr || e?.message || String(e)).toString().trim().split("\n").slice(-3).join(" ")
@@ -1067,8 +1093,37 @@ function sshCommandForUser(userId: string, vault: string = "default"): string {
  * INSIDE the (now-unlocked) personal repo and only reaches the team. This avoids
  * the recursion of "use a key stored in the repo to reach the repo itself".
  */
-function personalSshCommand(userId: string): string {
+let hostSshStrictMode: Promise<"accept-new" | "no"> | undefined
+
+async function resolveHostSshStrictMode(): Promise<"accept-new" | "no"> {
+  if (!hostSshStrictMode) {
+    hostSshStrictMode = execFileP("ssh", [
+      "-G",
+      "-o",
+      "StrictHostKeyChecking=accept-new",
+      "localhost",
+    ]).then(() => "accept-new" as const, () => "no" as const)
+  }
+  return await hostSshStrictMode
+}
+
+async function personalSshCommand(
+  userId: string,
+  authMode: "managed-key" | "host" = "managed-key",
+): Promise<string> {
+  if (authMode === "host") {
+    const strictMode = await resolveHostSshStrictMode()
+    return `ssh -o BatchMode=yes -o StrictHostKeyChecking=${strictMode}`
+  }
   return `ssh -i ${hostDeployKeyPath(userId)} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null`
+}
+
+async function personalSshCommandForDir(userId: string, dir: string): Promise<string> {
+  try {
+    const { stdout } = await execFileP("git", ["-C", dir, "config", "--get", "loopat.personalSshAuth"])
+    if (stdout.trim() === "host") return await personalSshCommand(userId, "host")
+  } catch {}
+  return await personalSshCommand(userId)
 }
 
 async function swapPersonalDir(
@@ -1116,10 +1171,10 @@ async function autoInitGitCrypt(
     }
   }
 
-  // Local-only commit author so this doesn't depend on global git config
+  // Pin the resolved author locally so the bootstrap commit and every later
+  // personal-repo commit satisfy the same host push rules.
   try {
-    await execFileP("git", ["-C", repoDir, "config", "user.email", author?.email ?? "loopat@local"])
-    await execFileP("git", ["-C", repoDir, "config", "user.name", author?.name ?? "loopat"])
+    await configureGitCommitAuthor(repoDir, author)
   } catch (e: any) {
     return { ok: false, error: `git config failed: ${e?.message ?? e}` }
   }
@@ -1231,7 +1286,7 @@ async function autoInitGitCrypt(
 
   try {
     await execFileP("git", ["-C", repoDir, "push", "origin", `HEAD:${branch}`], {
-      env: { ...process.env, GIT_SSH_COMMAND: personalSshCommand(userId) },
+      env: { ...process.env, GIT_SSH_COMMAND: await personalSshCommandForDir(userId, repoDir) },
     })
   } catch (e: any) {
     await rollbackSavedKey(userId)
@@ -1290,6 +1345,32 @@ export type PersonalDirtyStatus = {
   hasRemote: boolean
 }
 
+async function readGitConfig(dir: string, key: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileP("git", ["-C", dir, "config", "--get", key])
+    return stdout.trim() || undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function configureGitCommitAuthor(dir: string, preferred?: GitAuthor): Promise<Required<GitAuthor>> {
+  const author = selectGitAuthor({
+    preferred,
+    configured: {
+      name: process.env.LOOPAT_GIT_AUTHOR_NAME,
+      email: process.env.LOOPAT_GIT_AUTHOR_EMAIL,
+    },
+    existing: {
+      name: await readGitConfig(dir, "user.name"),
+      email: await readGitConfig(dir, "user.email"),
+    },
+  })
+  await execFileP("git", ["-C", dir, "config", "user.name", author.name])
+  await execFileP("git", ["-C", dir, "config", "user.email", author.email])
+  return author
+}
+
 /**
  * Inspect personal/<user>/: how many uncommitted worktree changes, how many
  * commits not reachable from any remote-tracking branch. Used as the
@@ -1314,7 +1395,7 @@ export async function inspectPersonalDirty(userId: string): Promise<PersonalDirt
   if (hasRemote) {
     try {
       await execFileP("git", ["-C", dir, "fetch", "--quiet", "origin"], {
-        env: { ...process.env, GIT_SSH_COMMAND: personalSshCommand(userId) },
+        env: { ...process.env, GIT_SSH_COMMAND: await personalSshCommandForDir(userId, dir) },
         timeout: 15_000,
       })
     } catch {}
@@ -1358,11 +1439,9 @@ export async function syncPersonalToRemote(
     return { ok: false, error: "personal/ is not a git repo — nothing to sync to" }
   }
 
-  // Author must be set for the commit step. Set locally so we don't rely
-  // on the host's global git config.
+  // Preserve the author chosen at import (or inherit the host Git identity).
   try {
-    await execFileP("git", ["-C", dir, "config", "user.email", "loopat@local"])
-    await execFileP("git", ["-C", dir, "config", "user.name", "loopat"])
+    await configureGitCommitAuthor(dir)
   } catch (e: any) {
     return { ok: false, error: `git config failed: ${e?.message ?? e}` }
   }
@@ -1418,7 +1497,7 @@ export async function syncPersonalToRemote(
 
   try {
     await execFileP("git", ["-C", dir, "push", "origin", `HEAD:${branch}`], {
-      env: { ...process.env, GIT_SSH_COMMAND: personalSshCommand(userId) },
+      env: { ...process.env, GIT_SSH_COMMAND: await personalSshCommandForDir(userId, dir) },
     })
   } catch (e: any) {
     const stderr = (e?.stderr ?? "").toString().trim()
@@ -1482,10 +1561,7 @@ async function commitLocalChanges(
   message: string,
 ): Promise<{ ok: true; committed: boolean } | { ok: false; error: string }> {
   try {
-    try { await execFileP("git", ["-C", dir, "config", "user.email"]) }
-    catch { await execFileP("git", ["-C", dir, "config", "user.email", "loopat@local"]) }
-    try { await execFileP("git", ["-C", dir, "config", "user.name"]) }
-    catch { await execFileP("git", ["-C", dir, "config", "user.name", "loopat"]) }
+    await configureGitCommitAuthor(dir)
     await execFileP("git", ["-C", dir, "add", "-A"])
   } catch (e: any) {
     return { ok: false, error: `git add failed: ${e?.stderr ?? e?.message ?? e}` }
@@ -1537,7 +1613,7 @@ export async function pullPersonalFromRemote(
       try { await execFileP("git", ["-C", dir, "rebase", "--abort"], { env: silent }) } catch {}
       try { await execFileP("git", ["-C", dir, "merge", "--abort"], { env: silent }) } catch {}
       await execFileP("git", ["-C", dir, "fetch", "origin"], {
-        env: { ...silent, GIT_SSH_COMMAND: personalSshCommand(userId) }, timeout: 30_000,
+        env: { ...silent, GIT_SSH_COMMAND: await personalSshCommandForDir(userId, dir) }, timeout: 30_000,
       })
       await execFileP("git", ["-C", dir, "reset", "--hard", `origin/${branch}`], { env: silent })
       await execFileP("git", ["-C", dir, "clean", "-fd"], { env: silent })
@@ -1550,7 +1626,7 @@ export async function pullPersonalFromRemote(
   // Normal pull: commit local edits so the tree is clean, then rebase onto origin.
   const c = await commitLocalChanges(dir, "loopat: local personal edits")
   if (!c.ok) return { ok: false, error: c.error }
-  const reb = await rebaseOntoOrigin(dir, branch, personalSshCommand(userId))
+  const reb = await rebaseOntoOrigin(dir, branch, await personalSshCommandForDir(userId, dir))
   if (!reb.ok) {
     if ("conflict" in reb) return { ok: false, error: "conflict with remote", conflict: true, files: reb.files }
     return { ok: false, error: reb.error }
@@ -1587,14 +1663,15 @@ export async function pushPersonalToRemote(
 
   const c = await commitLocalChanges(dir, "loopat: sync personal vault")
   if (!c.ok) return { ok: false, error: c.error }
-  const reb = await rebaseOntoOrigin(dir, branch, personalSshCommand(userId))
+  const sshCommand = await personalSshCommandForDir(userId, dir)
+  const reb = await rebaseOntoOrigin(dir, branch, sshCommand)
   if (!reb.ok) {
     if ("conflict" in reb) return { ok: false, error: "conflict with remote", conflict: true, files: reb.files }
     return { ok: false, error: reb.error }
   }
   try {
     await execFileP("git", ["-C", dir, "push", "origin", `HEAD:${branch}`], {
-      env: { ...process.env, GIT_SSH_COMMAND: personalSshCommand(userId) },
+      env: { ...process.env, GIT_SSH_COMMAND: sshCommand },
     })
   } catch (e: any) {
     const stderr = (e?.stderr ?? "").toString().trim()

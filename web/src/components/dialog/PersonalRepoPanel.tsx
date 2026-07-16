@@ -95,8 +95,14 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
     getPersonalStatus()
       .then((s) => {
         setStatus(s)
-        setRepoUrl(s?.personalRepo ?? "")
-        setGhRepoName(s?.gitHost?.defaultRepo ?? "loopat-personal")
+        const directRepo = s?.gitHost?.directRepo
+        setRepoUrl(s?.personalRepo ?? directRepo?.url ?? "")
+        setGhRepoName(directRepo?.path ?? s?.gitHost?.defaultRepo ?? "loopat-personal")
+        if (directRepo) {
+          setGhLogin(directRepo.owner)
+          setGhRepos([{ name: directRepo.path.split("/").at(-1) ?? directRepo.path, path: directRepo.path }])
+          setStep("confirm")
+        }
       })
       .finally(() => setLoading(false))
   }, [])
@@ -107,7 +113,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
     if (!initialToken || loading) return
     setGhToken(initialToken)
     setGhBusy(true)
-    listPersonalRepos(initialToken)
+    listPersonalRepos(initialToken, { provider: status?.gitHost?.provider, baseUrl: status?.gitHost?.baseUrl })
       .then((res) => {
         if (!res.ok) { setGhError(res.error ?? "invalid token"); return }
         setGhRepos(res.repos)
@@ -115,7 +121,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
         setStep("repo")
       })
       .finally(() => setGhBusy(false))
-  }, [initialToken, loading])
+  }, [initialToken, loading, status?.gitHost?.baseUrl, status?.gitHost?.provider])
 
   const copyPub = async () => {
     if (!status?.publicKey) return
@@ -170,7 +176,12 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
     setGhError(null)
     setGhBusy(true)
     try {
-      const r = await setupPersonalGithub(ghToken.trim(), ghRepoName.trim() || undefined, ghCryptKey.trim() || undefined)
+      const r = await setupPersonalGithub(
+        ghToken.trim(),
+        ghRepoName.trim() || undefined,
+        ghCryptKey.trim() || undefined,
+        { provider: status?.gitHost?.provider, baseUrl: status?.gitHost?.baseUrl },
+      )
       if (!r.ok) {
         if (r.needsCryptKey) {
           setGhNeedsCryptKey(true)
@@ -197,7 +208,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
     setGhError(null)
     setGhBusy(true)
     try {
-      const res = await listPersonalRepos(ghToken.trim())
+      const res = await listPersonalRepos(ghToken.trim(), { provider: status?.gitHost?.provider, baseUrl: status?.gitHost?.baseUrl })
       if (!res.ok) {
         // bad token → stay on the token step and show the error, instead of
         // advancing to a misleading empty repo picker
@@ -213,11 +224,15 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
   }
 
   const ghProvider = status?.gitHost?.provider ?? "github"
-  const ghProviderLabel = ghProvider === "github" ? "GitHub" : ghProvider
-  const ghRepoExists = ghRepos.some((r) => r.name === ghRepoName.trim())
+  const directRepo = status?.gitHost?.directRepo ?? null
+  const ghProviderLabel = ghProvider === "github" ? "GitHub" : ghProvider === "gitlab" ? "GitLab" : ghProvider
+  const ghRepoValue = ghRepoName.trim()
+  const ghRepoExists = ghRepos.some((r) => ghRepoValue === r.path || ghRepoValue === r.name)
+  const ghRepoPathForUrl = ghRepoValue.includes("/") ? ghRepoValue : ghLogin && ghRepoValue ? `${ghLogin}/${ghRepoValue}` : ""
+  const ghBaseUrl = (status?.gitHost?.baseUrl ?? (ghProvider === "github" ? "https://github.com" : "")).replace(/\/+$/, "")
   const ghRepoWebUrl =
-    ghLogin && ghRepoName.trim()
-      ? `${(status?.gitHost?.baseUrl ?? "https://github.com").replace(/\/+$/, "")}/${ghLogin}/${ghRepoName.trim()}`
+    ghBaseUrl && ghRepoPathForUrl
+      ? `${ghBaseUrl}/${ghRepoPathForUrl.replace(/\.git$/i, "")}`
       : null
 
   if (loading) {
@@ -313,7 +328,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
     return <ImportedPanel status={status} />
   }
 
-  if (!status.publicKey) {
+  if (!status.publicKey && !directRepo) {
     return (
       <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-2 leading-relaxed">
         No deploy key available — the server is probably missing{" "}
@@ -329,7 +344,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
   return (
     <div className="flex flex-col gap-3">
       {/* wizard progress */}
-      <div className="flex items-center gap-2 text-[11px] mb-1">
+      {!directRepo && <div className="flex items-center gap-2 text-[11px] mb-1">
         {[
           { k: "token", label: "Token" },
           { k: "repo", label: "Repository" },
@@ -357,7 +372,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
             {i < 2 && <span className="text-gray-300">→</span>}
           </div>
         ))}
-      </div>
+      </div>}
 
       {/* Device-flow hand-off: token prefilled, repos loading — skip the paste UI. */}
       {step === "token" && initialToken && (
@@ -438,7 +453,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
       <div className="relative">
         <textarea
           readOnly
-          value={status.publicKey}
+          value={status.publicKey ?? ""}
           rows={3}
           className="w-full text-[11px] font-mono text-gray-800 bg-gray-50 border border-gray-200 rounded p-2 outline-none resize-none"
           onClick={(e) => (e.target as HTMLTextAreaElement).select()}
@@ -571,12 +586,14 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
               </div>
             )}
             {ghRepos.map((r) => {
-              const sel = ghRepoName.trim() === r.name
+              const value = r.path || r.name
+              const sel = ghRepoValue === value || ghRepoValue === r.name
+              const personalish = /personal/i.test(r.name) || /personal/i.test(r.path)
               return (
                 <button
                   key={r.path}
                   type="button"
-                  onClick={() => setGhRepoName(r.name)}
+                  onClick={() => setGhRepoName(value)}
                   className={`flex items-center justify-between gap-2 px-2 py-1.5 rounded text-left text-xs ${
                     sel ? "bg-gray-900 text-white" : "hover:bg-gray-100 text-gray-700"
                   }`}
@@ -584,7 +601,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
                   <span className="flex items-center gap-1.5 min-w-0">
                     {sel && <Check size={12} className="shrink-0" />}
                     <span className="truncate font-medium">{r.name}</span>
-                    {r.name.includes("personal") && (
+                    {personalish && (
                       <span
                         className={`text-[9px] px-1 rounded ${
                           sel ? "bg-white/20" : "bg-emerald-100 text-emerald-700"
@@ -615,7 +632,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
                     setStep("confirm")
                   }
                 }}
-                placeholder="loopat-personal"
+                placeholder={status.gitHost?.defaultRepo ?? "loopat-personal"}
                 className="flex-1 px-2 py-1.5 text-sm border border-gray-300 rounded outline-none focus:border-gray-500"
               />
               <span
@@ -656,6 +673,12 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
       {/* ── Step 3: confirm what's about to happen ── */}
       {step === "confirm" && (
         <div className="flex flex-col gap-3">
+          {directRepo && (
+            <div className="text-[11px] text-gray-500 leading-relaxed">
+              This repository is configured by the server administrator. Loopat will use the host's
+              existing SSH identity, so no GitLab API token is required.
+            </div>
+          )}
           <div className="border border-gray-200 rounded p-3 text-xs text-gray-700 leading-relaxed flex flex-col gap-2">
             {ghRepoExists ? (
               <>
@@ -709,7 +732,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
             <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1.5">{ghError}</div>
           )}
           <div className="flex gap-2 mt-1">
-            <button
+            {!directRepo && <button
               type="button"
               onClick={() => {
                 setStep("repo")
@@ -719,7 +742,7 @@ export function PersonalRepoPanel({ onDone, initialToken }: { onDone?: () => voi
               className="px-3 h-9 text-sm rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
             >
               Back
-            </button>
+            </button>}
             <button
               type="button"
               onClick={submitGithub}
