@@ -4,7 +4,7 @@ import { appendFile, readFile, readdir, rm, writeFile, mkdir } from "node:fs/pro
 import { createWriteStream, mkdirSync, existsSync } from "node:fs"
 import { randomUUID } from "node:crypto"
 import { join } from "node:path"
-import { loopClaudeDir, loopDir, loopHistoryPath, personalSkillsDir, workspaceTeamSkillsDir } from "./paths"
+import { loopClaudeDir, loopDir, loopHistoryPath, loopWorkdir, personalSkillsDir, workspaceTeamSkillsDir } from "./paths"
 import { appendLoopUsage, appendLoopUsageClear, insertUsageDb, type UsageEntry } from "./usage"
 import { resolveSandboxClaudeBinary } from "./claude-binary"
 import { loadConfig, loadPersonalConfig, parseDefault, getModelByTier, pickProvider, type ProviderConfig } from "./config"
@@ -19,6 +19,17 @@ import { updateLoopStatus, setLoopPhase } from "./loop-status"
 import { tracer, withSpan } from "./tracer"
 import { SpanStatusCode, type Span } from "@opentelemetry/api"
 import { maybeAutoName } from "./auto-name"
+import {
+  buildCodexEnv,
+  buildCodexExecArgs,
+  codexBinary,
+  codexCompletedItem,
+  codexEventError,
+  codexThreadId,
+  codexTurnUsage,
+  parseCodexEvent,
+  type CodexUsage,
+} from "./codex-cli"
 
 // Tests override LOOPAT_CLAUDE_BIN to point at a mock binary (a script that
 // reads stream-json from stdin and writes canned messages back) so we can
@@ -202,6 +213,16 @@ type QueuedMessage = {
 
 export type LoopSessionMessageListener = (msg: any) => void
 
+type CodexRuntimeContext = {
+  loopId: string
+  driver: string
+  providerName: string
+  provider: ProviderConfig
+  modelId: string
+  modelArg?: string
+  loopatAppend: string
+}
+
 class LoopSession {
   id: string
   private q: Query | null = null
@@ -229,6 +250,10 @@ class LoopSession {
   private usageSession = 0
   private currentDriver: string | null = null
   private gateway: LoopGateway | null = null
+  private codexRuntime: CodexRuntimeContext | null = null
+  private codexProc: ReturnType<typeof nodeSpawn> | null = null
+  private interruptedCodexProcesses = new WeakSet<ReturnType<typeof nodeSpawn>>()
+  private destroyed = false
 
   constructor(id: string) {
     this.id = id
@@ -243,9 +268,10 @@ class LoopSession {
   }
 
   private scheduleIdleCleanup() {
+    if (this.destroyed) return
     if (this.idleTimer) return
     if (this.subscribers.size > 0) return
-    if (this.consuming) return // never interrupt an active generation
+    if (this.consuming || this.generating) return // never interrupt an active generation
     const tag = this.id.slice(0, 8)
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null
@@ -256,6 +282,22 @@ class LoopSession {
     }, IDLE_TIMEOUT_MS)
   }
 
+  private autoNameLoop(): void {
+    maybeAutoName(this.id).then(async (didName) => {
+      if (!didName) return
+      const fresh = await getLoop(this.id)
+      if (fresh) this.broadcast({ type: "meta_updated", meta: fresh })
+    }).catch(() => {})
+  }
+
+  private stopCodexProcess(): void {
+    const proc = this.codexProc
+    this.codexProc = null
+    if (!proc) return
+    this.interruptedCodexProcesses.add(proc)
+    try { proc.kill("SIGTERM") } catch {}
+  }
+
   private async resolveProvider(meta: { createdBy: string; driver?: string; config?: { vault?: string } }, candidateNames: (string | null | undefined)[], requireKey: boolean): Promise<{ name: string; provider: ProviderConfig } | null> {
     const pCfg = await loadPersonalConfig(effectiveDriver(meta), meta.config?.vault)
     const wCfg = await loadConfig()
@@ -263,11 +305,8 @@ class LoopSession {
   }
 
   /**
-   * Set the active provider. Takes effect on the next user message — each
-   * turn spawns a fresh claude binary via `ensureStarted`, which calls
-   * `buildLoopEnv` with the current `providerOverride`. No need to
-   * interrupt the running turn; the new provider applies naturally when
-   * the current response finishes and the next message triggers a new spawn.
+   * Set the active provider. The current runtime is stopped so the next user
+   * message resolves the new provider and starts the matching runtime.
    */
   setProvider(name: string | null) {
     this.providerOverride = name
@@ -290,8 +329,8 @@ class LoopSession {
       setAt: this.goalSetAt,
       status: this.goalStatus,
     })
-    if (this.q) {
-      // Re-compose: the next ensureStarted picks up the goal via buildLoopatAppend.
+    if (this.q || this.codexRuntime) {
+      // The next ensureStarted rebuilds the system prompt with the new goal.
       this.restartOnNextMessage()
     }
   }
@@ -314,14 +353,9 @@ class LoopSession {
   }
 
   /**
-   * Interrupt the current `query()` and clear `this.q`, so the next user
-   * message triggers a fresh `ensureStarted()` — picking up changes to env
-   * vars, provider config, **mcpServers**, etc. Conversation history is
-   * preserved because the SDK reads its session JSONL from disk on respawn
-   * (`continue: true` when `hasPriorSdkSession` is true).
-   *
-   * Idempotent: calling on a session that doesn't currently hold a query is
-   * a no-op. Fire-and-forget; the interrupt runs in the background.
+   * Stop the active runtime so the next user message re-runs `ensureStarted()`.
+   * Claude resumes from its SDK JSONL; Codex resumes from its persisted thread.
+   * Fire-and-forget and idempotent.
    */
   restartOnNextMessage() {
     if (this.q) {
@@ -330,6 +364,8 @@ class LoopSession {
       this.input = pushIterable<SDKUserMessage>()
       dying.interrupt().catch(() => {})
     }
+    this.stopCodexProcess()
+    this.codexRuntime = null
   }
 
   private async loadHistoryFromDisk() {
@@ -347,10 +383,9 @@ class LoopSession {
   }
 
   private async ensureStarted() {
-    if (this.q) return
+    if (this.q || this.codexRuntime) return
     return withSpan("ensureStarted", async (rootSpan) => {
     rootSpan.setAttribute("loop.id", this.id.slice(0, 8))
-    const shouldContinue = await hasPriorSdkSession(this.id)
     const meta = await getLoop(this.id)
     if (!meta) {
       throw new Error(`loop ${this.id} meta missing`)
@@ -375,6 +410,44 @@ class LoopSession {
 
     const loopatAppend = await buildLoopatAppend(meta)
     const loopId = this.id
+
+    let modelId: string | undefined = meta.config?.default_model_id
+    if (!modelId) {
+      const pCfg = await loadPersonalConfig(driver, meta.config?.vault)
+      const defaultParsed = parseDefault(pCfg.default)
+      if (defaultParsed.modelId && defaultParsed.providerName === providerName) {
+        modelId = defaultParsed.modelId
+      }
+    }
+    const activeModel = (modelId ? provider.models.find(m => m.id === modelId) : undefined)
+      ?? provider.models[0]
+    const autoCompactWindow = activeModel?.maxContextTokens
+
+    // Codex is a host CLI runtime. It does not need Claude settings, plugins,
+    // podman, or the Anthropic egress gateway below.
+    if (provider.runtime === "codex") {
+      this.codexRuntime = {
+        loopId,
+        driver,
+        providerName,
+        provider,
+        modelId: activeModel?.id ?? modelId ?? "",
+        modelArg: provider.apiKey ? (activeModel?.id ?? modelId ?? "") : undefined,
+        loopatAppend,
+      }
+      this.broadcast({
+        type: "provider",
+        name: providerName,
+        model: this.codexRuntime.modelId,
+        models: provider.models,
+        contextWindow: resolveContextWindow(provider, this.codexRuntime.modelId),
+        runtime: "codex",
+      })
+      return
+    }
+
+    this.codexRuntime = null
+    const shouldContinue = await hasPriorSdkSession(this.id)
 
     // Compose runs ONCE at loop creation (loops.ts:createLoop). At spawn we
     // only re-compose if the snapshot is missing — this happens for loops
@@ -430,17 +503,6 @@ class LoopSession {
     if (!this.gateway) this.gateway = startLoopGateway(loopId, extraEnv.ANTHROPIC_BASE_URL ?? provider.baseUrl, !!process.env.LOOPAT_EGRESS_TRACE)
     extraEnv.ANTHROPIC_BASE_URL = `http://host.containers.internal:${this.gateway.port}`
 
-    let modelId: string | undefined = meta.config?.default_model_id
-    if (!modelId) {
-      const pCfg = await loadPersonalConfig(driver, meta.config?.vault)
-      const defaultParsed = parseDefault(pCfg.default)
-      if (defaultParsed.modelId && defaultParsed.providerName === providerName) {
-        modelId = defaultParsed.modelId
-      }
-    }
-    const activeModel = (modelId ? provider.models.find(m => m.id === modelId) : undefined)
-      ?? provider.models[0]
-    const autoCompactWindow = activeModel?.maxContextTokens
     // Ensure the per-loop podman container exists and is running. Idempotent:
     // if the container is already up with the same config-hash, no-op.
     let building = false
@@ -759,14 +821,7 @@ class LoopSession {
           resultReceived = true
           this.turnSpan?.end()
           this.turnSpan = null
-          // Fire-and-forget: try to auto-name the loop if title is still
-          // "untitled". maybeAutoName() is fully idempotent + best-effort
-          // (no-ops if title is already set or user has opted out).
-          maybeAutoName(this.id).then(async (didName) => {
-            if (!didName) return
-            const fresh = await getLoop(this.id)
-            if (fresh) this.broadcast({ type: "meta_updated", meta: fresh })
-          }).catch(() => {})
+          this.autoNameLoop()
         } else if (
           // Inject queued messages at tool-result boundaries — matching
           // real Claude Code's per-step queue consumption.
@@ -1094,6 +1149,7 @@ class LoopSession {
             model: activeModelId,
             models: resolved.provider.models,
             contextWindow: resolveContextWindow(resolved.provider, activeModelId),
+            runtime: resolved.provider.runtime,
           }))
         } else {
           console.warn(`[loop:${this.id.slice(0, 8)}] no provider found in personal or workspace config`)
@@ -1308,13 +1364,232 @@ class LoopSession {
     this.history.push(userMsg)
     this.persist(userMsg)
     this.broadcast(userMsg)
+    if (this.codexRuntime) {
+      await this.runCodexTurn(text, this.codexRuntime, images)
+      return
+    }
     this.input.push(userMsg)
+  }
+
+  private codexThreadPath(): string {
+    return join(loopDir(this.id), "codex-thread.json")
+  }
+
+  private async loadCodexThreadId(): Promise<string | null> {
+    try {
+      const j = JSON.parse(await readFile(this.codexThreadPath(), "utf8"))
+      return typeof j?.threadId === "string" && j.threadId ? j.threadId : null
+    } catch {
+      return null
+    }
+  }
+
+  private async saveCodexThreadId(threadId: string): Promise<void> {
+    await mkdir(loopDir(this.id), { recursive: true })
+    await writeFile(this.codexThreadPath(), JSON.stringify({ threadId }, null, 2) + "\n")
+  }
+
+  private buildCodexPrompt(text: string, ctx: CodexRuntimeContext, images?: ImageInput[]): string {
+    const imageNote = images && images.length > 0
+      ? `\n\n[loopat] ${images.length} image attachment(s) were omitted because this Codex runtime adapter only forwards text today. Ask the user to describe or reattach them as files if they matter.`
+      : ""
+    return [
+      ctx.loopatAppend.trim(),
+      `\n\n[loopat] You are running inside loopat via OpenAI Codex CLI. The workspace root is:\n${loopWorkdir(ctx.loopId)}\n`,
+      "Reply normally to the user. If you edit files or run commands, summarize the important results.",
+      "\n\nUser message:\n",
+      text,
+      imageNote,
+    ].join("")
+  }
+
+  private async runCodexTurn(text: string, ctx: CodexRuntimeContext, images?: ImageInput[]): Promise<void> {
+    const loopId = ctx.loopId
+    const tag = loopId.slice(0, 8)
+    const startedAt = Date.now()
+    this.generating = true
+    this.queueProcessing = false
+    updateLoopStatus(loopId, "Codex running...")
+
+    const workdir = loopWorkdir(loopId)
+    const prompt = this.buildCodexPrompt(text, ctx, images)
+    const threadId = await this.loadCodexThreadId()
+    const codexBin = codexBinary()
+    const args = buildCodexExecArgs({ workdir, threadId, modelArg: ctx.modelArg })
+
+    mkdirSync(loopDir(loopId), { recursive: true })
+    const stderrLogPath = join(loopDir(loopId), "stderr.log")
+    const stderrFile = createWriteStream(stderrLogPath, { flags: "a" })
+    stderrFile.write(`\n=== ${new Date().toISOString()} codex spawn ===\n`)
+    stderrFile.write(`binary: ${codexBin}\nargv: ${args.map((a) => (a.includes(" ") ? JSON.stringify(a) : a)).join(" ")}\n`)
+
+    const proc = nodeSpawn(codexBin, args, {
+      cwd: workdir,
+      env: buildCodexEnv({
+        apiKey: ctx.provider.apiKey,
+        baseUrl: ctx.provider.baseUrl,
+      }),
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    this.codexProc = proc
+
+    let stdoutBuf = ""
+    let stderrBuf = ""
+    let eventError = ""
+    let sawTurnCompleted = false
+    const turnUsages: CodexUsage[] = []
+
+    const handleLine = (line: string) => {
+      const trimmed = line.trim()
+      if (!trimmed) return
+      const event = parseCodexEvent(trimmed)
+      if (!event) {
+        if (DEBUG) console.error(`[codex:${tag}:stdout] ${trimmed}`)
+        return
+      }
+
+      const parsedError = codexEventError(event)
+      if (parsedError) {
+        eventError = parsedError
+        stderrFile.write(`[codex event] ${parsedError}\n`)
+        return
+      }
+
+      const startedThreadId = codexThreadId(event)
+      if (startedThreadId) {
+        this.saveCodexThreadId(startedThreadId).catch(() => {})
+        return
+      }
+
+      if (event.type === "turn.started") {
+        this.broadcast({ type: "system", subtype: "init", runtime: "codex", uuid: randomUUID() })
+        return
+      }
+
+      const item = codexCompletedItem(event)
+      if (item) {
+        if (item.type === "agent_message" && item.text?.trim()) {
+          if (this.ttfbSpan) {
+            this.ttfbSpan.end()
+            this.ttfbSpan = null
+          }
+          const assistantMsg = {
+            type: "assistant" as const,
+            message: { role: "assistant" as const, content: [{ type: "text", text: item.text }] },
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+          }
+          this.history.push(assistantMsg as any)
+          this.persist(assistantMsg)
+          this.broadcast(assistantMsg)
+          this.updateStatus(assistantMsg)
+        } else if (DEBUG) {
+          console.error(`[codex:${tag}] item.completed ${item.type}`)
+        }
+        return
+      }
+
+      if (event.type === "turn.completed") {
+        sawTurnCompleted = true
+        const usage = codexTurnUsage(event)
+        if (usage) turnUsages.push(usage)
+        return
+      }
+    }
+
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      stdoutBuf += chunk.toString("utf8")
+      const lines = stdoutBuf.split("\n")
+      stdoutBuf = lines.pop() ?? ""
+      for (const line of lines) handleLine(line)
+    })
+
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      stderrFile.write(chunk)
+      stderrBuf += chunk.toString("utf8")
+      const text = chunk.toString("utf8")
+      for (const line of text.split("\n")) {
+        if (line.trim()) console.error(`[codex:${tag}:stderr] ${line}`)
+      }
+    })
+
+    proc.stdin?.end(prompt)
+
+    const code = await new Promise<number | null>((resolve, reject) => {
+      proc.on("error", reject)
+      proc.on("exit", (c) => resolve(c))
+    }).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      stderrFile.write(`spawn error: ${message}\n`)
+      return -1
+    })
+
+    if (stdoutBuf.trim()) handleLine(stdoutBuf)
+    stderrFile.end(`=== exit code=${code} ===\n`)
+    const interrupted = this.interruptedCodexProcesses.delete(proc)
+    if (this.codexProc === proc) this.codexProc = null
+
+    if (!interrupted && (code !== 0 || eventError)) {
+      const detail = eventError || stderrBuf.trim() || "see stderr.log"
+      const err = {
+        type: "error",
+        message: code === 0
+          ? `Codex turn failed: ${detail.slice(0, 1000)}`
+          : `Codex exited with code ${code}: ${detail.slice(0, 1000)}`,
+      }
+      this.turnSpan?.recordException(new Error(err.message))
+      this.turnSpan?.setStatus({ code: SpanStatusCode.ERROR, message: err.message })
+      this.history.push(err as any)
+      this.persist(err)
+      this.broadcast(err)
+    }
+
+    const lastUsage = turnUsages.at(-1)
+    const usage = lastUsage
+      ? {
+          input_tokens: lastUsage.inputTokens,
+          output_tokens: lastUsage.outputTokens,
+          cache_read_input_tokens: lastUsage.cachedInputTokens,
+        }
+      : undefined
+    const result = {
+      type: "result" as const,
+      ...(usage ? { usage } : {}),
+      ...(lastUsage ? {
+        modelUsage: {
+          [ctx.modelId || ctx.providerName]: {
+            inputTokens: lastUsage.inputTokens,
+            outputTokens: lastUsage.outputTokens,
+            cacheReadInputTokens: lastUsage.cachedInputTokens,
+            cacheCreationInputTokens: 0,
+          },
+        },
+      } : {}),
+      duration_ms: Date.now() - startedAt,
+      runtime: "codex",
+    }
+    this.history.push(result as any)
+    this.persist(result)
+    if ((result as any).modelUsage) this.persistUsage(result as any)
+    this.broadcast(result)
+    this.turnSpan?.end()
+    this.turnSpan = null
+    this.ttfbSpan?.end()
+    this.ttfbSpan = null
+    if (sawTurnCompleted) this.autoNameLoop()
+
+    this.generating = false
+    this.queueProcessing = false
+    updateLoopStatus(loopId, sawTurnCompleted ? "Ready" : interrupted ? "Interrupted" : "Codex stopped")
+    this.processNextInQueue()
+    this.scheduleIdleCleanup()
   }
 
   /** Process the next queued message. Called from consume()'s finally block
    *  after each generation completes. Only starts the next message; subsequent
    *  messages are handled recursively by consume()'s finally. */
   private processNextInQueue() {
+    if (this.destroyed) return
     if (this.queueProcessing) return // already processing
     if (this.messageQueue.length === 0) {
       this.broadcast({ type: "queue_update", queue: [] })
@@ -1367,8 +1642,10 @@ class LoopSession {
   }
 
   async interrupt() {
-    this.generating = false
+    const codexWasRunning = this.codexProc !== null
+    if (!codexWasRunning) this.generating = false
     if (this.q) await this.q.interrupt().catch(() => {})
+    this.stopCodexProcess()
   }
 
   /** Background in-flight foreground tasks (Bash commands + subagents) so the
@@ -1403,6 +1680,7 @@ class LoopSession {
   /** Tear down the SDK process and disconnect all subscribers. Used when a
    *  loop is archived so no orphaned processes remain. */
   async destroy() {
+    this.destroyed = true
     this.cancelIdleCleanup()
     this.generating = false
     this.queueProcessing = false
@@ -1417,6 +1695,8 @@ class LoopSession {
       try { await this.q.interrupt() } catch {}
       this.q = null
     }
+    this.stopCodexProcess()
+    this.codexRuntime = null
     for (const [, pending] of this.pendingQuestions) {
       pending.reject(new Error("loop archived"))
     }
@@ -1522,6 +1802,8 @@ class LoopSession {
       try { await this.q.interrupt() } catch {}
       this.q = null
     }
+    this.stopCodexProcess()
+    await rm(this.codexThreadPath(), { force: true }).catch(() => {})
     // 2. Drop SDK context without deleting history. Touch an empty new
     //    jsonl in each existing encoded-cwd subdir so --continue picks it.
     //    If no subdir exists yet (no SDK has spawned in this loop), the

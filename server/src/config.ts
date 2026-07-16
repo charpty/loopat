@@ -70,10 +70,27 @@ export function normalizeModelEntry(m: ModelEntryDisk): ModelEntry {
   return { id: m.id, ...(m.maxContextTokens ? { maxContextTokens: m.maxContextTokens } : {}), ...(m.tier ? { tier: m.tier } : {}) }
 }
 
+export type ProviderRuntime = "claude" | "codex"
+
+export function normalizeProviderRuntime(runtime: unknown): ProviderRuntime {
+  return runtime === "codex" ? "codex" : "claude"
+}
+
+function normalizeProviderModelsFromDisk(p: { models?: ModelEntryDisk[]; model?: string }): ModelEntry[] {
+  if (Array.isArray(p.models) && p.models.length > 0) {
+    return p.models.map(m => normalizeModelEntry(m))
+  }
+  if (typeof p.model === "string" && p.model.trim()) {
+    return [{ id: p.model.trim() }]
+  }
+  return []
+}
+
 export type ProviderPreset = {
   name: string
   baseUrl: string
   models: ModelEntryDisk[]
+  runtime?: ProviderRuntime
 }
 
 export type MiseToolPreset = {
@@ -95,9 +112,13 @@ export type PresetsData = {
  */
 export type ProviderConfigDisk = {
   models?: ModelEntryDisk[]
+  /** Legacy single-model field accepted from older config.json files and clients. */
+  model?: string
   baseUrl: string
   apiKey?: string
   enabled?: boolean
+  /** Which agent runtime should consume this provider. Defaults to Claude Code. */
+  runtime?: ProviderRuntime
   /** Per-tier model. Written → passed as ANTHROPIC_DEFAULT_*_MODEL; absent → CC native. */
   opus_model?: string
   sonnet_model?: string
@@ -112,6 +133,7 @@ export type ProviderConfig = {
   baseUrl: string
   apiKey: string
   enabled: boolean
+  runtime: ProviderRuntime
   opus_model?: string
   sonnet_model?: string
   haiku_model?: string
@@ -333,28 +355,31 @@ export function pickProvider(
     if (seen.has(name)) continue
     seen.add(name)
     const p = pCfg.providers[name] ?? wCfg.providers?.[name]
-    if (p && (!requireKey || p.apiKey)) return { name, provider: p }
+    if (!p || p.enabled === false) continue
+    if (p && (!requireKey || p.apiKey || p.runtime === "codex")) return { name, provider: p }
   }
   return null
 }
 
-/** Preset providers with Anthropic-compatible endpoints. loopat uses the
- *  Claude Agent SDK which speaks the Anthropic Messages API — only providers
- *  that expose an Anthropic-compatible endpoint work directly.
- *  Each provider is disabled by default; the user supplies an API key. */
+/** Preset providers. Claude runtime entries use Anthropic-compatible endpoints;
+ *  Codex runtime entries use the local Codex CLI and can rely on `codex login`. */
 import { DEFAULT_PROVIDER_PRESETS } from "./presets"
 
 function buildPresetProviders(): Record<string, ProviderConfig> {
   return Object.fromEntries(
-    DEFAULT_PROVIDER_PRESETS.map(p => [
-      p.name,
-      {
-        models: p.models.map(m => normalizeModelEntry(m)),
-        baseUrl: p.baseUrl,
-        apiKey: "",
-        enabled: false,
-      } satisfies ProviderConfig,
-    ]),
+    DEFAULT_PROVIDER_PRESETS.map(p => {
+      const runtime = normalizeProviderRuntime(p.runtime)
+      return [
+        p.name,
+        {
+          models: p.models.map(m => normalizeModelEntry(m)),
+          baseUrl: p.baseUrl,
+          apiKey: "",
+          enabled: runtime === "codex",
+          runtime,
+        } satisfies ProviderConfig,
+      ]
+    }),
   )
 }
 
@@ -378,10 +403,12 @@ const PERSONAL_DISK_TEMPLATE: PersonalConfigDisk = {
       default: DEFAULT_PROVIDER_PRESETS[0] ? `${DEFAULT_PROVIDER_PRESETS[0].name}/${normalizeModelEntry(DEFAULT_PROVIDER_PRESETS[0].models[0]).id}` : "",
     }
     for (const p of DEFAULT_PROVIDER_PRESETS) {
+      const runtime = normalizeProviderRuntime(p.runtime)
       providers[p.name] = {
         models: p.models.map(m => normalizeModelEntry(m)),
         baseUrl: p.baseUrl,
-        enabled: false,
+        runtime,
+        enabled: runtime === "codex",
       }
     }
     return providers
@@ -409,9 +436,12 @@ export async function loadConfig(): Promise<WorkspaceConfig> {
   if (cachedWorkspace && mtimeMs === cachedWorkspaceMtimeMs) return cachedWorkspace
   const raw = await readFile(path, "utf8")
   const parsed = JSON.parse(raw) as WorkspaceConfig
+  parsed.providers = { ...buildPresetProviders(), ...(parsed.providers ?? {}) }
   if (parsed.providers) {
     for (const [, p] of Object.entries(parsed.providers)) {
       if (p.enabled === undefined) (p as any).enabled = true
+      ;(p as any).runtime = normalizeProviderRuntime((p as any).runtime)
+      ;(p as any).models = normalizeProviderModelsFromDisk(p as any)
     }
   }
   cachedWorkspace = parsed
@@ -512,15 +542,14 @@ export async function loadPersonalConfig(
       const vaultPath = join(personalVaultDir(user, vault), (p.apiKey as any).vault as string)
       try { apiKey = (await readFile(vaultPath, "utf8")).trim() } catch {}
     }
-    // Normalize: mixed string|object → canonical ModelEntry[].
-    const models: ModelEntry[] = Array.isArray(p.models)
-      ? p.models.map(m => normalizeModelEntry(m as ModelEntryDisk))
-      : []
+    // Normalize both canonical `models` and the legacy single `model`.
+    const models = normalizeProviderModelsFromDisk(p)
     providers[name] = {
       models,
       baseUrl: p.baseUrl,
       apiKey,
       enabled: p.enabled !== false,
+      runtime: normalizeProviderRuntime(p.runtime),
       ...(typeof p.opus_model === "string" && p.opus_model ? { opus_model: p.opus_model } : {}),
       ...(typeof p.sonnet_model === "string" && p.sonnet_model ? { sonnet_model: p.sonnet_model } : {}),
       ...(typeof p.haiku_model === "string" && p.haiku_model ? { haiku_model: p.haiku_model } : {}),
@@ -680,11 +709,16 @@ export async function savePersonalDisk(
         return { ok: false, error: `provider "${name}" must be an object` }
       }
       const p = val as ProviderConfigDisk
-      if (!Array.isArray(p.models) || p.models.length === 0) {
+      const models = normalizeProviderModelsFromDisk(p)
+      if (models.length === 0) {
         return { ok: false, error: `provider "${name}" missing models` }
       }
+      p.models = models
       if (typeof p.baseUrl !== "string") {
         return { ok: false, error: `provider "${name}" missing baseUrl` }
+      }
+      if (p.runtime !== undefined && p.runtime !== "claude" && p.runtime !== "codex") {
+        return { ok: false, error: `provider "${name}" runtime must be "claude" or "codex"` }
       }
       if (p.apiKey !== undefined && typeof p.apiKey !== "string" && !(typeof p.apiKey === "object" && typeof (p.apiKey as any).vault === "string")) {
         return { ok: false, error: `provider "${name}" apiKey must be a string or { vault }` }
@@ -705,7 +739,7 @@ export async function savePersonalDisk(
     for (const [name, val] of Object.entries(patch.providers)) {
       if (name === "default" || !val || typeof val !== "object") continue
       const p = val as ProviderConfigDisk
-      if (p.enabled !== false) {
+      if (p.enabled !== false && normalizeProviderRuntime(p.runtime) !== "codex") {
         const hasNewKey = (typeof p.apiKey === "string" && p.apiKey.length > 0) || (p.apiKey && typeof (p.apiKey as any).vault === "string")
         const existingEntry = disk.providers[name]
         const existingKey = (existingEntry && typeof existingEntry === "object") ? (existingEntry as ProviderConfigDisk).apiKey : undefined
@@ -785,7 +819,7 @@ async function readPersonalDisk(user: string): Promise<PersonalConfigDisk> {
  */
 export async function savePersonalConfig(user: string, cfg: {
   default?: string
-  providers?: Record<string, { models?: ModelEntry[]; baseUrl: string; apiKey?: string; enabled?: boolean; opus_model?: string; sonnet_model?: string; haiku_model?: string; agent_model?: string }>
+  providers?: Record<string, { models?: ModelEntry[]; model?: string; baseUrl: string; apiKey?: string; enabled?: boolean; runtime?: ProviderRuntime; opus_model?: string; sonnet_model?: string; haiku_model?: string; agent_model?: string }>
 }): Promise<void> {
   const disk = await readPersonalDisk(user)
   const existingDefault = typeof disk.providers.default === "string" ? disk.providers.default : ""
@@ -818,14 +852,13 @@ export async function savePersonalConfig(user: string, cfg: {
         // No new key, no existing key → leave field unset (provider disabled).
         apiKeyField = undefined
       }
-      const models: ModelEntry[] = Array.isArray(p.models)
-        ? p.models.map(m => normalizeModelEntry(m as ModelEntryDisk))
-        : []
+      const models = normalizeProviderModelsFromDisk(p)
       rebuilt[name] = {
         baseUrl: p.baseUrl,
         ...(apiKeyField !== undefined ? { apiKey: apiKeyField } : {}),
         ...(models.length > 0 ? { models } : {}),
         ...(p.enabled === false ? { enabled: false } : {}),
+        ...(p.runtime && p.runtime !== "claude" ? { runtime: p.runtime } : {}),
         ...(p.opus_model ? { opus_model: p.opus_model } : {}),
         ...(p.sonnet_model ? { sonnet_model: p.sonnet_model } : {}),
         ...(p.haiku_model ? { haiku_model: p.haiku_model } : {}),
@@ -871,14 +904,18 @@ export async function saveWorkspaceConfig(cfg: Partial<WorkspaceConfig>): Promis
     for (const [name, p] of Object.entries(cfg.providers)) {
       const existingProv = merged.providers[name]
       const incoming = p as any
-      const models: ModelEntry[] = incoming.models?.length > 0
-        ? incoming.models.map((m: any) => normalizeModelEntry(m as ModelEntryDisk))
-        : existingProv?.models ?? []
+      const incomingModels = normalizeProviderModelsFromDisk(incoming)
+      const models: ModelEntry[] = incomingModels.length > 0 ? incomingModels : existingProv?.models ?? []
       merged.providers[name] = {
         models,
         baseUrl: incoming.baseUrl ?? existingProv?.baseUrl ?? "",
         apiKey: incoming.apiKey || existingProv?.apiKey || "",
         enabled: incoming.enabled !== undefined ? incoming.enabled : (existingProv?.enabled ?? true),
+        runtime: normalizeProviderRuntime(incoming.runtime ?? existingProv?.runtime),
+        ...(incoming.opus_model ?? existingProv?.opus_model ? { opus_model: incoming.opus_model ?? existingProv?.opus_model } : {}),
+        ...(incoming.sonnet_model ?? existingProv?.sonnet_model ? { sonnet_model: incoming.sonnet_model ?? existingProv?.sonnet_model } : {}),
+        ...(incoming.haiku_model ?? existingProv?.haiku_model ? { haiku_model: incoming.haiku_model ?? existingProv?.haiku_model } : {}),
+        ...(incoming.agent_model ?? existingProv?.agent_model ? { agent_model: incoming.agent_model ?? existingProv?.agent_model } : {}),
       } as any
     }
   }

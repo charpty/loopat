@@ -171,6 +171,25 @@ export async function ensureCollaborator(
   if (r.status !== 201 && r.status !== 204) fail("add collaborator", r)
 }
 
+type OnboardingProviderConfig = {
+  apiKey?: unknown
+  runtime?: unknown
+  enabled?: unknown
+  baseUrl?: string
+  model?: string
+}
+
+function providerConfigs(value: unknown): Record<string, OnboardingProviderConfig> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, OnboardingProviderConfig>
+    : {}
+}
+
+function providerReady(value: OnboardingProviderConfig): boolean {
+  return (typeof value.apiKey === "string" && value.apiKey.trim().length > 0) ||
+    (value.runtime === "codex" && value.enabled !== false)
+}
+
 /** The built-in GitHub provider — adapts the functions above onto GitHostProvider. */
 export const githubProvider: GitHostProvider = {
   id: "github",
@@ -183,7 +202,11 @@ export const githubProvider: GitHostProvider = {
   // the device dance (start/poll) and, on token, provisions the repo. Once the
   // repo is imported there's nothing left to gate on, so we're done.
   async onboarding(ctx) {
+    const wsProviders = providerConfigs(ctx.workspaceConfig?.providers)
+    const hasWorkspaceKey = Object.values(wsProviders).some(providerReady)
     if (!ctx.personalRepoImported) {
+      // Workspace-level AI, including keyless Codex, is enough for local-only loops.
+      if (hasWorkspaceKey) return { done: true }
       return {
         done: false,
         show: {
@@ -196,10 +219,8 @@ export const githubProvider: GitHostProvider = {
     // Step 2: need at least one usable AI key. Check personal config first
     // (keys already expanded from vault), then workspace-shared providers so
     // users can skip the key-entry form when the workspace already has keys.
-    const providers = (ctx.config?.providers ?? {}) as Record<string, any>
-    const hasPersonalKey = Object.values(providers).some((p) => p && typeof p.apiKey === "string" && p.apiKey.trim().length > 0)
-    const wsProviders = (ctx.workspaceConfig?.providers ?? {}) as Record<string, any>
-    const hasWorkspaceKey = Object.values(wsProviders).some((p) => p && typeof p.apiKey === "string" && p.apiKey.trim().length > 0)
+    const providers = providerConfigs(ctx.config?.providers)
+    const hasPersonalKey = Object.values(providers).some(providerReady)
     const hasKey = hasPersonalKey || hasWorkspaceKey
     const anthropic = providers.anthropic ?? {}
     if (!hasKey) {

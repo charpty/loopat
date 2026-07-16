@@ -21,6 +21,7 @@ import {
   type AdminUser,
   type WorkspaceSettings,
   type ModelEntry,
+  type ProviderRuntime,
   type ProviderPreset,
 } from "@/api"
 
@@ -245,6 +246,7 @@ type WorkspaceDraft = {
   providers: Record<string, {
     models: ModelEntry[]
     baseUrl: string
+    runtime: ProviderRuntime
     apiKey: string
     keyDirty: boolean
     hasKey: boolean
@@ -284,6 +286,7 @@ export function WorkspacePanel() {
             ...(m.maxContextTokens && m.maxContextTokens > 0 ? { maxContextTokens: m.maxContextTokens } : {}),
           })) ?? [],
           baseUrl: prov.baseUrl ?? "",
+          runtime: (prov as any).runtime === "codex" ? "codex" : "claude",
           apiKey: "",
           keyDirty: false,
           hasKey: prov.hasKey ?? false,
@@ -394,7 +397,7 @@ export function WorkspacePanel() {
     setDraft((d) => {
       if (!d) return d
       return { ...d, providers: { ...d.providers, [n]: {
-        models: [], baseUrl: "", apiKey: "", keyDirty: false, hasKey: false, enabled: false,
+        models: [], baseUrl: "", runtime: "claude", apiKey: "", keyDirty: false, hasKey: false, enabled: false,
       } } }
     })
     setNewName("")
@@ -417,6 +420,7 @@ export function WorkspacePanel() {
         out[name] = {
           models,
           baseUrl: p.baseUrl,
+          runtime: p.runtime,
           enabled: p.enabled,
         }
         if (p.keyDirty && p.apiKey.trim()) out[name].apiKey = p.apiKey.trim()
@@ -449,7 +453,7 @@ export function WorkspacePanel() {
       {names.map((name) => {
         const p = draft.providers[name]
         const isAddingModel = addingModel[name] ?? false
-        const hasKey = p.hasKey || p.apiKey.trim() !== ""
+        const hasKey = p.runtime === "codex" || p.hasKey || p.apiKey.trim() !== ""
         return (
           <div key={name} className="bg-white border border-gray-200 rounded-lg overflow-hidden">
             {/* Provider header */}
@@ -499,6 +503,16 @@ export function WorkspacePanel() {
             {/* Fields */}
             <div className="p-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+                <Labeled label="Runtime">
+                  <select
+                    value={p.runtime}
+                    onChange={(e) => updateProv(name, { runtime: e.target.value === "codex" ? "codex" : "claude" })}
+                    className={inputClass}
+                  >
+                    <option value="claude">Claude Code</option>
+                    <option value="codex">Codex</option>
+                  </select>
+                </Labeled>
                 <Labeled label="Base URL">
                   <input
                     value={p.baseUrl}
@@ -606,7 +620,7 @@ export function WorkspacePanel() {
                         onClick={async () => {
                           const newKey = p.apiKey.trim()
                           const tk = `${name}::${m.id}`
-                          if (!newKey && !p.hasKey) {
+                          if (p.runtime !== "codex" && !newKey && !p.hasKey) {
                             setTestingModel((t) => ({ ...t, [tk]: "error" }))
                             setTestError((t) => ({ ...t, [tk]: "enter an API key first" }))
                             setTimeout(() => {
@@ -619,8 +633,8 @@ export function WorkspacePanel() {
                           setTestError((t) => ({ ...t, [tk]: "" }))
                           try {
                             const result = newKey
-                              ? await testProviderConnection(p.baseUrl, newKey, m.id)
-                              : await testProviderConnection(p.baseUrl, "", m.id, name, "workspace")
+                              ? await testProviderConnection(p.baseUrl, newKey, m.id, undefined, undefined, p.runtime)
+                              : await testProviderConnection(p.baseUrl, "", m.id, name, "workspace", p.runtime)
                             setTestingModel((t) => ({ ...t, [tk]: result.ok ? "ok" : "error" }))
                             if (!result.ok) setTestError((t) => ({ ...t, [tk]: result.error ?? "unknown error" }))
                           } catch (e: any) {
@@ -632,15 +646,15 @@ export function WorkspacePanel() {
                             setTestError((t) => { const { [tk]: _, ...rest } = t; return rest })
                           }, 4000)
                         }}
-                        disabled={tmState === "testing" || (!p.hasKey && !p.apiKey.trim())}
+                        disabled={tmState === "testing" || (p.runtime !== "codex" && !p.hasKey && !p.apiKey.trim())}
                         className={`shrink-0 text-[9px] px-1 py-0 rounded transition-colors ${
-                          !p.hasKey && !p.apiKey.trim() ? "opacity-0 group-hover:opacity-100 text-gray-300" :
+                          p.runtime !== "codex" && !p.hasKey && !p.apiKey.trim() ? "opacity-0 group-hover:opacity-100 text-gray-300" :
                           tmState === "ok" ? "bg-emerald-100 text-emerald-700" :
                           tmState === "error" ? "bg-red-100 text-red-700" :
                           tmState === "testing" ? "bg-gray-100 text-gray-400 animate-pulse" :
                           "text-gray-400 hover:text-gray-700 opacity-0 group-hover:opacity-100"
                         }`}
-                        title={tmErr || (p.apiKey.trim() ? "test connection" : p.hasKey ? "test connection" : "enter an API key first")}
+                        title={tmErr || (p.runtime === "codex" ? "test Codex CLI" : p.apiKey.trim() ? "test connection" : p.hasKey ? "test connection" : "enter an API key first")}
                       >
                         {tmState === "ok" ? "OK" : tmState === "error" ? "FAIL" : tmState === "testing" ? "..." : "test"}
                       </button>
@@ -676,12 +690,16 @@ export function WorkspacePanel() {
                   providers: {
                     ...d.providers,
                     [p.name]: {
-                      models: p.models.map((m) => { const n = normalizePresetModel(m); return { id: n.id } }),
+                      models: p.models.map((m) => {
+                        const n = normalizePresetModel(m)
+                        return { id: n.id, ...(n.maxContextTokens ? { maxContextTokens: n.maxContextTokens } : {}) }
+                      }),
                       baseUrl: p.baseUrl,
+                      runtime: p.runtime === "codex" ? "codex" : "claude",
                       apiKey: "",
                       keyDirty: false,
                       hasKey: false,
-                      enabled: false,
+                      enabled: p.runtime === "codex",
                     } satisfies WorkspaceDraft["providers"][string],
                   },
                 }

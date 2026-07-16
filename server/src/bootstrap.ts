@@ -17,8 +17,9 @@ import {
   workspaceTeamClaudeMdPath,
 } from "./paths"
 import { listUsers } from "./auth"
+import { codexBinary } from "./codex-cli"
 
-type Check = { ok: boolean; label: string; hint?: string }
+type Check = { ok: boolean; label: string; hint?: string; required?: boolean }
 
 /** The host to print in the "open …" url. HOST=0.0.0.0/:: means "all
  *  interfaces" — localhost works locally but isn't reachable from other
@@ -84,6 +85,20 @@ function checkClaudeBinary(): Check {
   }
 }
 
+function checkCodexCli(): Check {
+  const codexBin = codexBinary()
+  try {
+    const out = execFileSync(codexBin, ["--version"], { stdio: "pipe" }).toString().trim()
+    return { ok: true, label: `codex cli: ${out || "available"}` }
+  } catch {
+    return {
+      ok: false,
+      label: "codex cli",
+      hint: "install Codex CLI or run `codex login` on the host if you want the Codex runtime",
+    }
+  }
+}
+
 function checkGitCrypt(): Check {
   try {
     const out = execFileSync("git-crypt", ["--version"], { stdio: "pipe" }).toString().trim()
@@ -126,6 +141,15 @@ export async function printBootstrapBanner(cfg: WorkspaceConfig) {
   // notes is declared inside the knowledge repo's .loopat/config.json. The repo
   // roster is per-user (personal config), so the workspace banner can't list it.
   const kcfg = await loadKnowledgeConfig()
+  const podman = checkPodman()
+  const claude = checkClaudeBinary()
+  const codex = checkCodexCli()
+  const hasUsableAgentRuntime = codex.ok || (podman.ok && claude.ok)
+  if (hasUsableAgentRuntime) {
+    podman.required = false
+    claude.required = false
+    codex.required = false
+  }
   const checks: Check[] = [
     { ok: true, label: `workspace: ${workspaceDir()}` },
     { ok: true, label: `team .claude/CLAUDE.md (${existsSync(workspaceTeamClaudeMdPath()) ? "present" : "absent"})` },
@@ -134,8 +158,9 @@ export async function printBootstrapBanner(cfg: WorkspaceConfig) {
     { ok: true, label: `repos:     (per-user, in personal config)` },
     await checkUsers(),
     { ok: existsSync(configPath()), label: `config: ${configPath()}` },
-    checkPodman(),
-    checkClaudeBinary(),
+    podman,
+    claude,
+    codex,
     checkGitCrypt(),
   ]
 
@@ -154,9 +179,9 @@ export async function printBootstrapBanner(cfg: WorkspaceConfig) {
     if (!c.ok && c.hint) console.log(`     ${yellow("→ " + c.hint)}`)
   }
   console.log(bar)
-  const blockers = checks.filter((c) => !c.ok)
+  const blockers = checks.filter((c) => !c.ok && c.required !== false)
   if (blockers.length > 0) {
-    console.log(`  ${yellow(`${blockers.length} thing(s) to fix`)} before chat will work — see hints above.\n`)
+    console.log(`  ${yellow(`${blockers.length} thing(s) to fix`)} before all required startup checks pass — see hints above.\n`)
     return false
   }
   // NB: the "ready. open …" line is intentionally NOT printed here. The banner

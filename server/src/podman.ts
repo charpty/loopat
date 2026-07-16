@@ -589,12 +589,17 @@ export async function probePodman(): Promise<PodmanProbeResult> {
   try {
     const { stdout } = await runPodman(["--version"])
     const version = stdout.trim()
+    if (process.platform === "darwin") {
+      await runPodman(["info"])
+    }
     return { ok: true, version }
   } catch (e: any) {
     return {
       ok: false,
       hint: e?.message?.includes("not found")
-        ? "install with: sudo apt install podman uidmap fuse-overlayfs"
+        ? (process.platform === "darwin" ? "install with: brew install podman" : "install with: sudo apt install podman uidmap fuse-overlayfs")
+        : process.platform === "darwin"
+          ? `podman machine unavailable: ${e?.message ?? e}; run: podman machine init && podman machine start`
         : `podman probe failed: ${e?.message ?? e}`,
     }
   }

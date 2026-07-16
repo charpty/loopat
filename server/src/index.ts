@@ -40,6 +40,7 @@ import {
   LOOPAT_HOME,
   LOOPAT_INSTALL_DIR,
   WORKSPACE,
+  workspaceDir,
   loopContextKnowledge,
   loopContextNotes,
   loopContextPersonal,
@@ -57,13 +58,20 @@ import {
   personalReposDir,
   loopsDir,
 } from "./paths"
-import { loadConfig, loadPersonalConfig, savePersonalConfig, saveWorkspaceConfig, getActiveProvider, readPersonalDiskRaw, savePersonalDisk, describeApiKeyRef, writeVaultEnv, deleteVaultEnv, loadA2AConfig, saveA2AConfig, type ProviderConfig, type ModelEntry } from "./config"
+import { loadConfig, loadPersonalConfig, savePersonalConfig, saveWorkspaceConfig, getActiveProvider, readPersonalDiskRaw, savePersonalDisk, describeApiKeyRef, writeVaultEnv, deleteVaultEnv, loadA2AConfig, saveA2AConfig, type ProviderConfig, type ProviderRuntime, type ModelEntry } from "./config"
 import { queryUserTokenUsage, queryWorkspaceTokenUsage, queryDailyTokenUsage, queryLoopTokenUsage } from "./usage"
 import { createApiToken, listApiTokens, revokeApiToken } from "./api-tokens"
 import { listBoards, createBoard, renameBoard, listKanbanColumns, addCard, toggleCard, deleteCard, moveCard, updateCardMeta, updateCardBlock, reorderCards, createColumn, deleteColumn, readKanbanConfig, saveColumnOrder, setColumnColor, renameColumn, assignDriverForCard, createLoopFromCard, linkLoopToCard, kanbanUserCtx } from "./kanban"
 import { printBootstrapBanner, printReadyLine } from "./bootstrap"
 import { resolveProvider } from "./providers"
 import { ensureSandboxClaudeBinary } from "./claude-binary"
+import {
+  buildCodexEnv,
+  buildCodexExecArgs,
+  codexBinary,
+  codexEventError,
+  parseCodexEvent,
+} from "./codex-cli"
 import { serveHostExec, hostExecSocketPath } from "./host-exec"
 import {
   createUser,
@@ -267,11 +275,11 @@ app.get("/api/serve/check-port", requireAuth, async (c) => {
 // (they carry per-user apiKeys via secrets/). Source field indicates origin.
 app.get("/api/providers", requireAuth, async (c) => {
   const wCfg = await loadConfig()
-  const providers: Record<string, { models: ModelEntry[]; baseUrl: string; source: "personal" | "workspace"; enabled: boolean; hasKey: boolean }> = {}
+  const providers: Record<string, { models: ModelEntry[]; baseUrl: string; runtime: ProviderRuntime; source: "personal" | "workspace"; enabled: boolean; hasKey: boolean }> = {}
   if (wCfg.providers) {
     for (const [name, p] of Object.entries(wCfg.providers)) {
       const hasKey = typeof p.apiKey === "string" && p.apiKey.length > 0
-      providers[name] = { models: p.models, baseUrl: p.baseUrl, source: "workspace", enabled: hasKey ? p.enabled : false, hasKey }
+      providers[name] = { models: p.models, baseUrl: p.baseUrl, runtime: p.runtime, source: "workspace", enabled: (hasKey || p.runtime === "codex") ? p.enabled : false, hasKey }
     }
   }
   // Overlay personal providers (they take precedence)
@@ -283,14 +291,69 @@ app.get("/api/providers", requireAuth, async (c) => {
       const hasKey = typeof p.apiKey === "string" && p.apiKey.length > 0
       // Only overlay if the user actually configured this provider (has a key).
       // Template/preset providers without a key should not shadow workspace config.
-      if (hasKey) {
-        providers[name] = { models: p.models, baseUrl: p.baseUrl, source: "personal", enabled: p.enabled !== false, hasKey }
+      if (hasKey || p.runtime === "codex") {
+        providers[name] = { models: p.models, baseUrl: p.baseUrl, runtime: p.runtime, source: "personal", enabled: p.enabled !== false, hasKey }
       }
     }
     active = pCfg.default || active
   } catch {}
   return c.json({ providers, default: active })
 })
+
+async function testCodexConnection(baseUrl: string, apiKey: string, model: string): Promise<{ ok: boolean; error?: string }> {
+  const args = buildCodexExecArgs({
+    workdir: workspaceDir(),
+    modelArg: apiKey && model ? model : undefined,
+    sandbox: "read-only",
+    ephemeral: true,
+  })
+
+  return await new Promise((resolve) => {
+    const child = spawn(codexBinary(), args, {
+      env: buildCodexEnv({ apiKey, baseUrl }),
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    let stdout = ""
+    let stderr = ""
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const finish = (result: { ok: boolean; error?: string }) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve(result)
+    }
+    child.stdin.end("Respond with exactly: ok")
+    timer = setTimeout(() => {
+      try { child.kill("SIGTERM") } catch {}
+      finish({ ok: false, error: "codex test timed out" })
+    }, 60_000)
+    child.stdout.on("data", (b) => { stdout += b.toString("utf8") })
+    child.stderr.on("data", (b) => { stderr += b.toString("utf8") })
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      finish({
+        ok: false,
+        error: error.code === "ENOENT" ? "codex CLI not found on PATH" : error.message,
+      })
+    })
+    child.on("exit", (code) => {
+      let eventError = ""
+      for (const line of stdout.split("\n")) {
+        const event = parseCodexEvent(line)
+        if (!event) continue
+        eventError = codexEventError(event) ?? eventError
+      }
+      if (code !== 0 || eventError) {
+        finish({
+          ok: false,
+          error: (eventError || stderr.trim() || `codex exited with code ${code}`).slice(0, 400),
+        })
+        return
+      }
+      finish({ ok: true })
+    })
+  })
+}
 
 // Test a provider + model connection by making a minimal Messages API call.
 // Accepts either a plain apiKey, or a provider name + source to resolve the
@@ -302,21 +365,31 @@ app.post("/api/providers/test", requireAuth, async (c) => {
   if (typeof model !== "string" || !model) return c.json({ ok: false, error: "model required" }, 400)
 
   let apiKey = typeof rawApiKey === "string" ? rawApiKey.trim() : ""
+  let runtime: ProviderRuntime = body.runtime === "codex" ? "codex" : "claude"
   // Resolve key server-side when a stored (encrypted) key is being tested
   if (!apiKey && typeof provider === "string" && provider) {
     if (source === "personal") {
       const userId = c.get("userId") as string
       try {
         const pCfg = await loadPersonalConfig(userId)
-        apiKey = pCfg.providers[provider]?.apiKey ?? ""
+        const p = pCfg.providers[provider]
+        apiKey = p?.apiKey ?? ""
+        runtime = p?.runtime ?? runtime
       } catch {}
     } else if (source === "workspace") {
       try {
         const wCfg = await loadConfig()
-        apiKey = (wCfg.providers?.[provider] as any)?.apiKey ?? ""
+        const p = wCfg.providers?.[provider]
+        apiKey = (p as any)?.apiKey ?? ""
+        runtime = p?.runtime ?? runtime
       } catch {}
     }
   }
+
+  if (runtime === "codex") {
+    return c.json(await testCodexConnection(baseUrl, apiKey, model))
+  }
+
   if (!apiKey) return c.json({ ok: false, error: "no API key — enter one or store it first" }, 400)
 
   try {
@@ -626,11 +699,12 @@ app.get("/api/settings/personal", requireAuth, async (c) => {
   const userId = c.get("userId") as string
   const cfg = await loadPersonalConfig(userId)
   const tokenUsage = queryUserTokenUsage(userId)
-  const providers: Record<string, { models: ModelEntry[]; baseUrl: string; hasKey: boolean; enabled: boolean }> = {}
+  const providers: Record<string, { models: ModelEntry[]; baseUrl: string; runtime: ProviderRuntime; hasKey: boolean; enabled: boolean }> = {}
   for (const [name, p] of Object.entries(cfg.providers)) {
     providers[name] = {
       models: p.models,
       baseUrl: p.baseUrl,
+      runtime: p.runtime,
       hasKey: !!p.apiKey,
       enabled: p.enabled,
     }
@@ -1007,10 +1081,10 @@ app.post("/api/plugins/refresh", requireAuth, async (c) => {
 
 app.get("/api/settings/workspace", requireAuth, requireAdmin, async (c) => {
   const cfg = await loadConfig()
-  const providers: Record<string, { models: ModelEntry[]; baseUrl: string; hasKey: boolean; enabled: boolean }> = {}
+  const providers: Record<string, { models: ModelEntry[]; baseUrl: string; runtime: ProviderRuntime; hasKey: boolean; enabled: boolean }> = {}
   if (cfg.providers) {
     for (const [name, p] of Object.entries(cfg.providers)) {
-      providers[name] = { models: p.models, baseUrl: p.baseUrl, hasKey: !!(p as any).apiKey, enabled: p.enabled }
+      providers[name] = { models: p.models, baseUrl: p.baseUrl, runtime: p.runtime, hasKey: !!(p as any).apiKey, enabled: p.enabled }
     }
   }
   const tokenUsage = queryWorkspaceTokenUsage()

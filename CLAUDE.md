@@ -5,11 +5,18 @@ Self-hosted AI workspace built around context management. Monorepo with two work
 ## Tech stack
 
 - **Runtime**: Bun (server + build tooling)
-- **Server**: Hono, TypeScript, Claude Agent SDK, podman (sandbox containers)
+- **Server**: Hono, TypeScript, Claude Agent SDK, Codex CLI runtime, podman (sandbox containers)
 - **Web**: React 19, Vite 8, Tailwind CSS v4, Zustand, assistant-ui, xterm.js, CodeMirror, Milkdown
 - **Infra**: Docker (oven/bun base), rootless podman inside container
 - **Tests**: Playwright (e2e + dogfood)
 - **Rust**: Two small binaries in `server/src/serve-rs` and `server/src/port-proxy-rs`, built as part of `web build`
+
+## Agent runtimes
+
+- Providers declare `runtime: "claude" | "codex"`; legacy provider configs default to Claude.
+- Claude runs through the Agent SDK inside podman. Codex runs through the host CLI and must not initialize Claude settings, plugins, MCP servers, containers, or the Anthropic egress gateway.
+- Keep Codex command construction, environment mapping, and JSONL parsing in `server/src/codex-cli.ts`. Session code owns lifecycle and UI event translation only.
+- Add focused adapter tests when Codex CLI arguments or event parsing changes. Preserve the existing Claude path unless a migration is explicitly required.
 
 ## Development
 

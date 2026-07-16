@@ -1091,7 +1091,8 @@ export async function listTopics(): Promise<TopicAggregate[]> {
 }
 
 export type ModelEntry = { id: string; maxContextTokens?: number }
-export type ProviderInfo = { model?: string; models: ModelEntry[]; baseUrl: string; source: "personal" | "workspace"; enabled: boolean; hasKey: boolean }
+export type ProviderRuntime = "claude" | "codex"
+export type ProviderInfo = { model?: string; models: ModelEntry[]; baseUrl: string; runtime?: ProviderRuntime; source: "personal" | "workspace"; enabled: boolean; hasKey: boolean }
 export type ProvidersResponse = { providers: Record<string, ProviderInfo>; default: string }
 export async function getProviders(): Promise<ProvidersResponse> {
   const r = await apiFetch("/api/providers")
@@ -1105,8 +1106,10 @@ export async function testProviderConnection(
   model: string,
   provider?: string,
   source?: "personal" | "workspace",
+  runtime?: ProviderRuntime,
 ): Promise<{ ok: boolean; error?: string }> {
   const body: Record<string, string> = { baseUrl, model }
+  if (runtime) body.runtime = runtime
   if (apiKey) {
     body.apiKey = apiKey
   } else if (provider && source) {
@@ -1270,6 +1273,7 @@ export type SettingsProvider = {
   model?: string
   models: ModelEntry[]
   baseUrl: string
+  runtime?: ProviderRuntime
   hasKey?: boolean
   enabled: boolean
   apiKey?: string
@@ -1284,7 +1288,7 @@ export type PersonalSettings = {
 }
 
 export type WorkspaceSettings = {
-  providers: Record<string, { models: ModelEntry[]; baseUrl: string; hasKey: boolean; enabled: boolean }>
+  providers: Record<string, { models: ModelEntry[]; baseUrl: string; runtime?: ProviderRuntime; hasKey: boolean; enabled: boolean }>
   default: string
   tokenUsage: TokenUsage
 }
@@ -1311,6 +1315,7 @@ export async function updatePersonalSettings(patch: {
 export type ProviderDisk = {
   models?: ModelEntry[]
   baseUrl: string
+  runtime?: ProviderRuntime
   /** Plain string; may contain `${VAR}` references resolved against vault envs/ at load. */
   apiKey?: string
   enabled?: boolean
@@ -1369,7 +1374,7 @@ export async function getWorkspaceSettings(): Promise<WorkspaceSettings> {
 }
 
 export async function updateWorkspaceSettings(patch: {
-  providers?: Record<string, { models?: ModelEntry[]; baseUrl: string; apiKey?: string; enabled?: boolean }>
+  providers?: Record<string, { models?: ModelEntry[]; baseUrl: string; runtime?: ProviderRuntime; apiKey?: string; enabled?: boolean }>
   default?: string
 }): Promise<boolean> {
   const r = await apiFetch("/api/settings/workspace", {
@@ -1407,16 +1412,17 @@ export async function getLoopTokenUsage(): Promise<LoopTokenUsage[]> {
 
 // ── admin presets ──
 
-export type ProviderPresetModel = string | { id: string; tier?: "opus" | "sonnet" | "haiku" }
+export type ProviderPresetModel = string | { id: string; tier?: "opus" | "sonnet" | "haiku"; maxContextTokens?: number }
 
 export type ProviderPreset = {
   name: string
   baseUrl: string
+  runtime?: ProviderRuntime
   models: ProviderPresetModel[]
 }
 
 /** Normalize a preset model entry to { id, tier? }. */
-export function normalizePresetModel(m: ProviderPresetModel): { id: string; tier?: "opus" | "sonnet" | "haiku" } {
+export function normalizePresetModel(m: ProviderPresetModel): { id: string; tier?: "opus" | "sonnet" | "haiku"; maxContextTokens?: number } {
   if (typeof m === "string") return { id: m }
   return m
 }

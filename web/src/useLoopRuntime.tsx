@@ -353,6 +353,7 @@ export interface ProviderInfo {
   model: string
   models: ModelEntry[]
   contextWindow: number
+  runtime?: "claude" | "codex"
 }
 
 export interface ContextUsage {
@@ -1207,6 +1208,7 @@ export function useLoopRuntime(loopId: string | null, currentUserId: string, ope
             model: String(m.model ?? models[0]?.id ?? ""),
             models,
             contextWindow: typeof m.contextWindow === "number" ? m.contextWindow : 200_000,
+            runtime: m.runtime === "codex" ? "codex" : "claude",
           })
           return
         }

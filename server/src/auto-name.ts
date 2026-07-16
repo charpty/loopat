@@ -82,7 +82,7 @@ async function resolveProvidersForLoop(meta: { createdBy: string; config?: { def
     if (seen.has(name)) continue
     seen.add(name)
     const p = pCfg.providers[name] ?? wCfg.providers?.[name]
-    if (p && p.apiKey) result.push(p)
+    if (p && p.apiKey && p.runtime !== "codex") result.push(p)
   }
   return result
 }

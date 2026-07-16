@@ -2,6 +2,23 @@
 
 If chat doesn't work or the UI shows red errors, walk this list top-to-bottom. Most issues land in §1 or §2.
 
+## Codex exits with code 1
+
+Loopat records Codex CLI diagnostics in the loop's `stderr.log`. Codex API
+failures arrive as JSONL events on stdout; Loopat extracts `error` and
+`turn.failed` events and shows their message in the chat.
+
+If the selected model requires a newer Codex CLI, upgrade the CLI or point
+Loopat at a newer binary before restarting:
+
+```sh
+LOOPAT_CODEX_BIN=/path/to/codex bun run dev
+```
+
+On macOS, ChatGPT may include a newer CLI at
+`/Applications/ChatGPT.app/Contents/Resources/codex`. Confirm it with
+`codex --version` before configuring the path.
+
 ## 0. The bootstrap banner is the first signal
 
 Whatever's wrong, look at the banner `bun run dev` prints first:

@@ -25,6 +25,7 @@ import {
   revokeApiToken,
   type PersonalConfigDisk,
   type ProviderDisk,
+  type ProviderRuntime,
   type RefExistsMap,
   type ModelEntry,
   type ApiTokenEntry,
@@ -351,6 +352,7 @@ type ProvidersDraft = {
   providers: Record<string, {
     models: ModelEntry[]
     baseUrl: string
+    runtime: ProviderRuntime
     enabled: boolean
     apiKeyNewValue: string
     apiKeyStored: boolean
@@ -397,6 +399,7 @@ function ProvidersSection({ disk, refExists, onChanged, disabled }: {
             ? p.models.map(m => typeof m === "string" ? { id: m } : { id: m.id, ...(m.maxContextTokens ? { maxContextTokens: m.maxContextTokens } : {}) })
             : [],
           baseUrl: p.baseUrl ?? "",
+          runtime: p.runtime === "codex" ? "codex" : "claude",
           enabled: p.enabled !== false,
           apiKeyNewValue: "",
           apiKeyStored: !!refInfo?.exists,
@@ -506,7 +509,7 @@ function ProvidersSection({ disk, refExists, onChanged, disabled }: {
       if (!d) return d
       if (d.providers[n]) return d
       return { ...d, providers: { ...d.providers, [n]: {
-        models: [], baseUrl: "", enabled: false,
+        models: [], baseUrl: "", runtime: "claude", enabled: false,
         apiKeyNewValue: "", apiKeyStored: false,
       } } }
     })
@@ -539,6 +542,7 @@ function ProvidersSection({ disk, refExists, onChanged, disabled }: {
         }))
       providersOut[name] = {
         baseUrl: p.baseUrl,
+        runtime: p.runtime,
         apiKey: `\${${providerEnvVarName(name)}}`,
         ...(models.length > 0 ? { models } : {}),
         ...(p.enabled ? {} : { enabled: false }),
@@ -570,7 +574,7 @@ function ProvidersSection({ disk, refExists, onChanged, disabled }: {
       {names.map((name) => {
         const p = draft.providers[name]
         const isAddingModel = addingModel[name] ?? false
-        const hasKey = p.apiKeyStored || p.apiKeyNewValue.trim() !== ""
+        const hasKey = p.runtime === "codex" || p.apiKeyStored || p.apiKeyNewValue.trim() !== ""
         return (
           <div key={name} className="bg-white border border-gray-200 rounded-lg overflow-hidden transition-shadow hover:shadow-sm">
             {/* Provider header */}
@@ -620,6 +624,16 @@ function ProvidersSection({ disk, refExists, onChanged, disabled }: {
             {/* Fields */}
             <div className="p-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+                <Labeled label="Runtime">
+                  <select
+                    value={p.runtime}
+                    onChange={(e) => updateProv(name, { runtime: e.target.value === "codex" ? "codex" : "claude" })}
+                    className={inputClass}
+                  >
+                    <option value="claude">Claude Code</option>
+                    <option value="codex">Codex</option>
+                  </select>
+                </Labeled>
                 <Labeled label="Base URL">
                   <input
                     value={p.baseUrl}
@@ -727,7 +741,7 @@ function ProvidersSection({ disk, refExists, onChanged, disabled }: {
                         onClick={async () => {
                           const newKey = p.apiKeyNewValue.trim()
                           const tk = `${name}::${m.id}`
-                          if (!newKey && !p.apiKeyStored) {
+                          if (p.runtime !== "codex" && !newKey && !p.apiKeyStored) {
                             setTestingModel((t) => ({ ...t, [tk]: "error" }))
                             setTestError((t) => ({ ...t, [tk]: "enter an API key first" }))
                             setTimeout(() => {
@@ -740,8 +754,8 @@ function ProvidersSection({ disk, refExists, onChanged, disabled }: {
                           setTestError((t) => ({ ...t, [tk]: "" }))
                           try {
                             const result = newKey
-                              ? await testProviderConnection(p.baseUrl, newKey, m.id)
-                              : await testProviderConnection(p.baseUrl, "", m.id, name, "personal")
+                              ? await testProviderConnection(p.baseUrl, newKey, m.id, undefined, undefined, p.runtime)
+                              : await testProviderConnection(p.baseUrl, "", m.id, name, "personal", p.runtime)
                             setTestingModel((t) => ({ ...t, [tk]: result.ok ? "ok" : "error" }))
                             if (!result.ok) setTestError((t) => ({ ...t, [tk]: result.error ?? "unknown error" }))
                           } catch (e: any) {
@@ -753,15 +767,15 @@ function ProvidersSection({ disk, refExists, onChanged, disabled }: {
                             setTestError((t) => { const { [tk]: _, ...rest } = t; return rest })
                           }, 4000)
                         }}
-                        disabled={tmState === "testing" || (!p.apiKeyStored && !p.apiKeyNewValue.trim())}
+                        disabled={tmState === "testing" || (p.runtime !== "codex" && !p.apiKeyStored && !p.apiKeyNewValue.trim())}
                         className={`shrink-0 text-[10px] px-1 py-0 rounded transition-colors ${
-                          !p.apiKeyStored && !p.apiKeyNewValue.trim() ? "opacity-0 group-hover:opacity-100 text-gray-300" :
+                          p.runtime !== "codex" && !p.apiKeyStored && !p.apiKeyNewValue.trim() ? "opacity-0 group-hover:opacity-100 text-gray-300" :
                           tmState === "ok" ? "bg-emerald-100 text-emerald-700" :
                           tmState === "error" ? "bg-red-100 text-red-700" :
                           tmState === "testing" ? "bg-gray-100 text-gray-400 animate-pulse" :
                           "text-gray-400 hover:text-gray-700 opacity-0 group-hover:opacity-100"
                         }`}
-                        title={tmErr || (p.apiKeyNewValue.trim() ? "test connection" : p.apiKeyStored ? "test connection" : "enter an API key first")}
+                        title={tmErr || (p.runtime === "codex" ? "test Codex CLI" : p.apiKeyNewValue.trim() ? "test connection" : p.apiKeyStored ? "test connection" : "enter an API key first")}
                       >
                         {tmState === "ok" ? "OK" : tmState === "error" ? "FAIL" : tmState === "testing" ? "..." : "test"}
                       </button>
@@ -797,9 +811,13 @@ function ProvidersSection({ disk, refExists, onChanged, disabled }: {
                   providers: {
                     ...d.providers,
                     [p.name]: {
-                      models: p.models.map((m) => { const n = normalizePresetModel(m); return { id: n.id } }),
+                      models: p.models.map((m) => {
+                        const n = normalizePresetModel(m)
+                        return { id: n.id, ...(n.maxContextTokens ? { maxContextTokens: n.maxContextTokens } : {}) }
+                      }),
                       baseUrl: p.baseUrl,
-                      enabled: false,
+                      runtime: p.runtime === "codex" ? "codex" : "claude",
+                      enabled: p.runtime === "codex",
                       apiKeyNewValue: "",
                       apiKeyStored: false,
                     },
@@ -1083,4 +1101,3 @@ function ApiTokensSection() {
     </div>
   )
 }
-

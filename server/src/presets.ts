@@ -1,4 +1,8 @@
-export const DEFAULT_PROVIDER_PRESETS: Array<{ name: string; baseUrl: string; models: Array<string | { id: string; tier?: "opus" | "sonnet" | "haiku"; maxContextTokens?: number }> }> = [
+export const DEFAULT_PROVIDER_PRESETS: Array<{ name: string; baseUrl: string; runtime?: "claude" | "codex"; models: Array<string | { id: string; tier?: "opus" | "sonnet" | "haiku"; maxContextTokens?: number }> }> = [
+  { name: "Codex", baseUrl: "https://api.openai.com/v1", runtime: "codex",
+    models: [
+      { id: "gpt-5-codex", maxContextTokens: 20_000_000 },
+    ]},
   { name: "Anthropic", baseUrl: "https://api.anthropic.com",
     models: [
       "claude-sonnet-4-20250514",

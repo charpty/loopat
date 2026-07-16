@@ -112,6 +112,7 @@ function ProviderPresetsEditor({
   const [adding, setAdding] = useState(false)
   const [newName, setNewName] = useState("")
   const [newBaseUrl, setNewBaseUrl] = useState("")
+  const [newRuntime, setNewRuntime] = useState<"claude" | "codex">("claude")
   const [newModels, setNewModels] = useState("")
 
   const add = () => {
@@ -120,8 +121,8 @@ function ProviderPresetsEditor({
     const models = newModels.trim()
       ? newModels.split("\n").map(s => s.trim()).filter(Boolean)
       : []
-    onChange([...presets, { name: n, baseUrl: newBaseUrl.trim(), models }])
-    setNewName(""); setNewBaseUrl(""); setNewModels(""); setAdding(false)
+    onChange([...presets, { name: n, baseUrl: newBaseUrl.trim(), runtime: newRuntime, models }])
+    setNewName(""); setNewBaseUrl(""); setNewRuntime("claude"); setNewModels(""); setAdding(false)
   }
 
   const remove = (idx: number) => {
@@ -144,6 +145,7 @@ function ProviderPresetsEditor({
             <thead>
               <tr className="border-b border-gray-100 bg-gray-50/50 text-left text-[10px] text-gray-500 uppercase tracking-wider">
                 <th className="px-3 py-2 font-medium w-1/5">Name</th>
+                <th className="px-3 py-2 font-medium w-32">Runtime</th>
                 <th className="px-3 py-2 font-medium">Base URL</th>
                 <th className="px-3 py-2 font-medium hidden sm:table-cell">Models</th>
                 <th className="px-3 py-2 font-medium w-10"></th>
@@ -159,6 +161,17 @@ function ProviderPresetsEditor({
                       disabled={saving}
                       className={inputClassSm}
                     />
+                  </td>
+                  <td className="px-3 py-2">
+                    <select
+                      value={p.runtime === "codex" ? "codex" : "claude"}
+                      onChange={(e) => update(idx, { runtime: e.target.value === "codex" ? "codex" : "claude" })}
+                      disabled={saving}
+                      className={inputClassSm}
+                    >
+                      <option value="claude">Claude</option>
+                      <option value="codex">Codex</option>
+                    </select>
                   </td>
                   <td className="px-3 py-2">
                     <input
@@ -214,6 +227,14 @@ function ProviderPresetsEditor({
               placeholder="Base URL"
               className={inputClassSm}
             />
+            <select
+              value={newRuntime}
+              onChange={(e) => setNewRuntime(e.target.value === "codex" ? "codex" : "claude")}
+              className={inputClassSm}
+            >
+              <option value="claude">Claude Code</option>
+              <option value="codex">Codex</option>
+            </select>
           </div>
           <textarea
             value={newModels}
