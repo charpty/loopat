@@ -334,7 +334,8 @@ export function parseDefault(raw: string): { providerName: string; modelId?: str
  *   3. workspace config's `default` field
  *   4. enumeration (personal first, then workspace)
  *
- * `requireKey=true` skips providers with empty apiKey and keeps walking.
+ * `requireKey=true` skips providers with empty apiKey and keeps walking, except
+ * Codex runtime providers which may rely on `codex login`.
  * Returns null when no match found.
  */
 export function pickProvider(

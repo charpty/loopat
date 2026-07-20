@@ -111,6 +111,16 @@ describe("pickProvider — requireKey semantics", () => {
     expect(r).toBeNull()
   })
 
+  test("allows Codex runtime providers without apiKey when requireKey=true", () => {
+    const r = pickProvider(
+      { default: "codex", providers: { codex: { ...p(""), runtime: "codex" } } },
+      {},
+      [],
+      true,
+    )
+    expect(r?.name).toBe("codex")
+  })
+
   test("returns null on completely empty configs", () => {
     expect(pickProvider({ default: "", providers: {} }, {}, [], true)).toBeNull()
     expect(pickProvider({ default: "", providers: {} }, {}, [], false)).toBeNull()

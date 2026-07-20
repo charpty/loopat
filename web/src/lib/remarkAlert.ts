@@ -35,6 +35,10 @@ const TITLE_TEXT: Record<AlertKind, string> = {
   caution: "Caution",
 };
 
+function classes(value: string): string[] {
+  return value.split(/\s+/).filter(Boolean);
+}
+
 function leadingText(node: Blockquote): Text | undefined {
   const first = node.children[0];
   if (!first || first.type !== "paragraph") return undefined;
@@ -60,7 +64,7 @@ export function remarkAlert() {
         children: [{ type: "text", value: TITLE_TEXT[kind] }],
         data: {
           hProperties: {
-            className: `mb-1 flex items-center gap-2 text-sm font-medium ${style.title}`,
+            className: classes(`mb-1 flex items-center gap-2 text-sm font-medium ${style.title}`),
           },
         },
       };
@@ -69,7 +73,7 @@ export function remarkAlert() {
       node.data = {
         hName: "div",
         hProperties: {
-          className: `my-4 border-l-4 ${style.border} rounded-r bg-gray-50/50 py-2 pr-2 pl-4 dark:bg-gray-800/30`,
+          className: classes(`my-4 border-l-4 ${style.border} rounded-r bg-gray-50/50 py-2 pr-2 pl-4 dark:bg-gray-800/30`),
           dir: "auto",
         },
       };

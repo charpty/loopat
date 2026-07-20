@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import {
   buildCodexEnv,
   buildCodexExecArgs,
+  codexModelArg,
   codexCompletedItem,
   codexEventError,
   codexTurnUsage,
@@ -56,6 +57,13 @@ describe("Codex CLI adapter", () => {
       "gpt-test",
       "-",
     ])
+  })
+
+  test("keeps model selection independent of API-key auth", () => {
+    expect(codexModelArg("gpt-test")).toBe("gpt-test")
+    expect(codexModelArg(" gpt-test ")).toBe("gpt-test")
+    expect(codexModelArg("")).toBeUndefined()
+    expect(codexModelArg(null)).toBeUndefined()
   })
 
   test("builds an isolated provider environment", () => {

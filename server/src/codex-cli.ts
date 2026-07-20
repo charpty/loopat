@@ -94,6 +94,11 @@ export function codexBinary(): string {
   return process.env.LOOPAT_CODEX_BIN || "codex"
 }
 
+export function codexModelArg(modelId?: string | null): string | undefined {
+  const value = modelId?.trim()
+  return value || undefined
+}
+
 export function buildCodexEnv(opts: {
   apiKey?: string
   baseUrl?: string

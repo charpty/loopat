@@ -70,6 +70,7 @@ import {
   buildCodexExecArgs,
   codexBinary,
   codexEventError,
+  codexModelArg,
   parseCodexEvent,
 } from "./codex-cli"
 import { serveHostExec, hostExecSocketPath } from "./host-exec"
@@ -303,7 +304,7 @@ app.get("/api/providers", requireAuth, async (c) => {
 async function testCodexConnection(baseUrl: string, apiKey: string, model: string): Promise<{ ok: boolean; error?: string }> {
   const args = buildCodexExecArgs({
     workdir: workspaceDir(),
-    modelArg: apiKey && model ? model : undefined,
+    modelArg: codexModelArg(model),
     sandbox: "read-only",
     ephemeral: true,
   })

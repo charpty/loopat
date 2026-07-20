@@ -25,6 +25,7 @@ import {
   codexBinary,
   codexCompletedItem,
   codexEventError,
+  codexModelArg,
   codexThreadId,
   codexTurnUsage,
   parseCodexEvent,
@@ -403,7 +404,7 @@ class LoopSession {
       ], true)
     })
     if (!resolved) {
-      throw new Error(`no provider with a valid apiKey for vault "${meta.config?.vault ?? "default"}" — set one in personal/${driver}/.loopat/vaults/${meta.config?.vault ?? "default"}/envs/`)
+      throw new Error(`no enabled provider is ready for vault "${meta.config?.vault ?? "default"}" — store an API key or enable a Codex runtime provider`)
     }
     const providerName = resolved.name
     const provider = resolved.provider
@@ -421,6 +422,7 @@ class LoopSession {
     }
     const activeModel = (modelId ? provider.models.find(m => m.id === modelId) : undefined)
       ?? provider.models[0]
+    const activeModelId = activeModel?.id ?? modelId ?? ""
     const autoCompactWindow = activeModel?.maxContextTokens
 
     // Codex is a host CLI runtime. It does not need Claude settings, plugins,
@@ -431,8 +433,8 @@ class LoopSession {
         driver,
         providerName,
         provider,
-        modelId: activeModel?.id ?? modelId ?? "",
-        modelArg: provider.apiKey ? (activeModel?.id ?? modelId ?? "") : undefined,
+        modelId: activeModelId,
+        modelArg: codexModelArg(activeModelId),
         loopatAppend,
       }
       this.broadcast({
